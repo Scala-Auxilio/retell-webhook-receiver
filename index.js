@@ -1,19 +1,16 @@
 const express = require("express");
 const crypto = require("crypto");
 const { Pool } = require("pg");
-const nodemailer = require("nodemailer");
 
 // --- Config -----------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const RETELL_WEBHOOK_SECRET = process.env.RETELL_WEBHOOK_SECRET || null;
 
-// --- Email Config ----------------------------------------------------------
-const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
-const SMTP_PORT = parseInt(process.env.SMTP_PORT) || 587;
-const SMTP_USER = process.env.SMTP_USER || null;
-const SMTP_PASS = process.env.SMTP_PASS || null;
-const NOTIFY_TO = process.env.NOTIFY_TO || SMTP_USER;
+// --- Email Config (Resend HTTP API) -----------------------------------------
+const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+const NOTIFY_FROM = process.env.NOTIFY_FROM || "onboarding@resend.dev";
+const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 
 if (!DATABASE_URL) {
@@ -21,7 +18,7 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// --- PostgreSQL ------------------------------------------------------------
+// --- PostgreSQL --------------------------------------------------------------
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.DB_SSL === "false" ? false : { rejectUnauthorized: false },
@@ -30,7 +27,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000,
 });
 
-// --- Table creation on startup ---------------------------------------------
+// --- Table creation on startup -----------------------------------------------
 async function initDatabase() {
   const client = await pool.connect();
   try {
@@ -47,6 +44,7 @@ async function initDatabase() {
       );
     `);
 
+    // Indexes for fast lookups by the Paperclip agents
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_retell_events_agent_id    ON retell_events (agent_id);
     `);
@@ -60,6 +58,7 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_retell_events_call_id     ON retell_events (call_id);
     `);
 
+    // Notifications log table
     await client.query(`
       CREATE TABLE IF NOT EXISTS notifications (
         id          SERIAL PRIMARY KEY,
@@ -80,26 +79,34 @@ async function initDatabase() {
   }
 }
 
-// --- Email transporter -----------------------------------------------------
-let transporter = null;
-if (SMTP_USER && SMTP_PASS) {
-  transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
+// --- Email via Resend HTTP API -----------------------------------------------
+async function sendEmail({ from, to, subject, text, html }) {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + RESEND_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ from, to: [to], subject, text, html: html || undefined }),
   });
-  console.log("Email transporter configured (" + SMTP_HOST + ":" + SMTP_PORT + ")");
-} else {
-  console.log("Email not configured (set SMTP_USER and SMTP_PASS to enable)");
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || JSON.stringify(data));
+  }
+  return data;
 }
 
-// --- Webhook signature verification (optional) ----------------------------
+if (RESEND_API_KEY) {
+  console.log("Email configured via Resend API (from: " + NOTIFY_FROM + ")");
+} else {
+  console.log("Email not configured (set RESEND_API_KEY to enable)");
+}
+// --- Webhook signature verification (optional) ------------------------------
 function verifySignature(rawBody, signature) {
-  if (!RETELL_WEBHOOK_SECRET) return true;
+  if (!RETELL_WEBHOOK_SECRET) return true; // skip if no secret configured
   if (!signature) {
     console.warn("[WARN] No x-retell-signature header present -- skipping verification.");
-    return true;
+    return true; // allow through but log warning
   }
   try {
     const hmac = crypto.createHmac("sha256", RETELL_WEBHOOK_SECRET);
@@ -112,9 +119,10 @@ function verifySignature(rawBody, signature) {
   }
 }
 
-// --- Express app -----------------------------------------------------------
+// --- Express app -------------------------------------------------------------
 const app = express();
 
+// Capture raw body for signature verification, then parse JSON
 app.use(
   express.json({
     limit: "5mb",
@@ -124,12 +132,12 @@ app.use(
   })
 );
 
-// --- Health check ----------------------------------------------------------
+// --- Health check ------------------------------------------------------------
 app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
-    version: "1.0.0",
+    version: "1.1.0",
     description: "Scala Auxilium -- Retell AI webhook ingestion for Paperclip monitoring agents",
   });
 });
@@ -143,14 +151,17 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// --- Main webhook endpoint -------------------------------------------------
+// --- Main webhook endpoint ---------------------------------------------------
 app.post("/webhooks/retell", async (req, res) => {
   const receivedAt = new Date().toISOString();
+
+  // Always return 200 immediately to Retell (10s timeout, 3 retries on non-2xx)
   res.status(200).json({ received: true });
 
   try {
     const payload = req.body;
 
+    // Signature verification
     if (RETELL_WEBHOOK_SECRET) {
       const signature = req.headers["x-retell-signature"];
       if (!verifySignature(req.rawBody, signature)) {
@@ -159,6 +170,7 @@ app.post("/webhooks/retell", async (req, res) => {
       }
     }
 
+    // Extract fields from payload
     const eventType = payload.event || "unknown";
     const callData = payload.call || {};
     const agentId = callData.agent_id || null;
@@ -166,6 +178,7 @@ app.post("/webhooks/retell", async (req, res) => {
     const transcript = callData.transcript || null;
     const callAnalysis = callData.call_analysis || null;
 
+    // Map agent IDs to friendly names for logging
     const agentNames = {
       agent_aa56b68b02f6de4ac5725a829b: "Aria EN (Sendsteps)",
       agent_e1e1f763101db5abe0df281891: "Aria NL (Sendsteps)",
@@ -178,9 +191,9 @@ app.post("/webhooks/retell", async (req, res) => {
         (transcript ? transcript.length + " chars" : "none")
     );
 
+    // Write to PostgreSQL
     await pool.query(
-      `INSERT INTO retell_events (event_type, agent_id, call_id, transcript, call_analysis, full_payload, received_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      "INSERT INTO retell_events (event_type, agent_id, call_id, transcript, call_analysis, full_payload, received_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
       [eventType, agentId, callId, transcript, callAnalysis ? JSON.stringify(callAnalysis) : null, JSON.stringify(payload), receivedAt]
     );
 
@@ -190,9 +203,9 @@ app.post("/webhooks/retell", async (req, res) => {
     console.error("  [ERR] Payload that failed to store:", JSON.stringify(req.body).substring(0, 500));
   }
 });
-
-// --- Email notification endpoint (for Paperclip agents) -------------------
+// --- Email notification endpoint (for Paperclip agents) ---------------------
 app.post("/notify", async (req, res) => {
+  // Auth check
   if (NOTIFY_SECRET) {
     const auth = req.headers["x-notify-secret"] || req.body.secret;
     if (auth !== NOTIFY_SECRET) {
@@ -200,8 +213,8 @@ app.post("/notify", async (req, res) => {
     }
   }
 
-  if (!transporter) {
-    return res.status(503).json({ error: "Email not configured. Set SMTP_USER and SMTP_PASS." });
+  if (!RESEND_API_KEY) {
+    return res.status(503).json({ error: "Email not configured. Set RESEND_API_KEY." });
   }
 
   const { subject, body, html, priority, source } = req.body;
@@ -209,43 +222,46 @@ app.post("/notify", async (req, res) => {
     return res.status(400).json({ error: "Missing required field: subject" });
   }
 
+  // Priority prefix for subject line
   const prefixes = { critical: "CRITICAL", high: "ALERT", normal: "", low: "FYI" };
   const prefix = prefixes[priority] || "";
   const fullSubject = prefix ? "[" + prefix + "] " + subject : subject;
 
   try {
-    await transporter.sendMail({
-      from: '"Scala Auxilium Agents" <' + SMTP_USER + '>',
+    await sendEmail({
+      from: NOTIFY_FROM,
       to: NOTIFY_TO,
       subject: fullSubject,
       text: body || subject,
       html: html || undefined,
     });
 
+    // Log to database
     await pool.query(
-      `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, $3, $4, 'sent')`,
+      "INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, $3, $4, 'sent')",
       [fullSubject, body || subject, priority || "normal", source || "unknown"]
     );
 
-    console.log('Email sent: "' + fullSubject + '" from ' + (source || "unknown"));
+    console.log("Email sent: \"" + fullSubject + "\" from " + (source || "unknown"));
     res.json({ sent: true, subject: fullSubject });
   } catch (err) {
+    // Log failure
     await pool.query(
-      `INSERT INTO notifications (subject, body, priority, source, status, error) VALUES ($1, $2, $3, $4, 'failed', $5)`,
+      "INSERT INTO notifications (subject, body, priority, source, status, error) VALUES ($1, $2, $3, $4, 'failed', $5)",
       [fullSubject, body || subject, priority || "normal", source || "unknown", err.message]
-    ).catch(() => {});
+    ).catch(function() {});
 
     console.error("Email send failed:", err.message);
     res.status(500).json({ error: "Failed to send email", details: err.message });
   }
 });
 
-// --- Notification history endpoint ----------------------------------------
+// --- Notification history endpoint ------------------------------------------
 app.get("/notifications", async (req, res) => {
   try {
     const { limit = 50 } = req.query;
     const result = await pool.query(
-      `SELECT * FROM notifications ORDER BY sent_at DESC LIMIT $1`,
+      "SELECT * FROM notifications ORDER BY sent_at DESC LIMIT $1",
       [Math.min(parseInt(limit) || 50, 200)]
     );
     res.json({ count: result.rows.length, notifications: result.rows });
@@ -254,44 +270,36 @@ app.get("/notifications", async (req, res) => {
   }
 });
 
-// --- Stats endpoint --------------------------------------------------------
+// --- Stats endpoint (useful for Paperclip agents) ---------------------------
 app.get("/stats", async (_req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        event_type,
-        agent_id,
-        COUNT(*) as count,
-        MIN(received_at) as earliest,
-        MAX(received_at) as latest
-      FROM retell_events
-      GROUP BY event_type, agent_id
-      ORDER BY latest DESC
-    `);
-    res.json({ total_events: result.rows.reduce((s, r) => s + parseInt(r.count), 0), breakdown: result.rows });
+    const result = await pool.query(
+      "SELECT event_type, agent_id, COUNT(*) as count, MIN(received_at) as earliest, MAX(received_at) as latest FROM retell_events GROUP BY event_type, agent_id ORDER BY latest DESC"
+    );
+    res.json({ total_events: result.rows.reduce(function(s, r) { return s + parseInt(r.count); }, 0), breakdown: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- Events query endpoint -------------------------------------------------
+// --- Events query endpoint (for Paperclip agents to pull recent events) -----
 app.get("/events", async (req, res) => {
   try {
     const { agent_id, event_type, since, limit = 100 } = req.query;
-    let query = "SELECT * FROM retell_events WHERE 1=1";
+    var query = "SELECT * FROM retell_events WHERE 1=1";
     const params = [];
-    let paramIdx = 1;
+    var paramIdx = 1;
 
     if (agent_id) {
-      query += " AND agent_id = $" + paramIdx++;
+      query += " AND agent_id = $" + (paramIdx++);
       params.push(agent_id);
     }
     if (event_type) {
-      query += " AND event_type = $" + paramIdx++;
+      query += " AND event_type = $" + (paramIdx++);
       params.push(event_type);
     }
     if (since) {
-      query += " AND received_at >= $" + paramIdx++;
+      query += " AND received_at >= $" + (paramIdx++);
       params.push(since);
     }
 
@@ -305,30 +313,12 @@ app.get("/events", async (req, res) => {
   }
 });
 
-// --- Start -----------------------------------------------------------------
+// --- Start -------------------------------------------------------------------
 async function start() {
   try {
     await initDatabase();
-    app.listen(PORT, "0.0.0.0", () => {
+    app.listen(PORT, "0.0.0.0", function() {
       console.log("Retell Webhook Receiver listening on port " + PORT);
-      console.log("   POST /webhooks/retell  - Retell webhook ingestion");
-      console.log("   POST /notify           - Send email notification");
-      console.log("   GET  /health           - Health check");
-      console.log("   GET  /stats            - Event statistics");
-      console.log("   GET  /events           - Query stored events");
-      console.log("   GET  /rotifications    - Notification history");
-      console.log("");
-      console.log("   Expected agents:");
-      console.log("   - Aria EN (Sendsteps):  agent_aa56b68b02f6de4ac5725a829b");
-      console.log("   - Aria NL (Sendsteps):  agent_e1e1f763101db5abe0df281891");
-      console.log("   - EconoWind Chat:       agent_760482429951f50e816c47b55a");
-      if (RETELL_WEBHOOK_SECRET) {
-        console.log("");
-        console.log("   [OK] Webhook signature verification ENABLED");
-      } else {
-        console.log("");
-        console.log("   [WARN] Webhook signature verification DISABLED (set RETELL_WEBHOOK_SECRET to enable)");
-      }
     });
   } catch (err) {
     console.error("Failed to start:", err);

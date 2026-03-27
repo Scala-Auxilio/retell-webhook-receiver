@@ -1,6 +1,6 @@
 {
   "name": "retell-webhook-receiver",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Lightweight webhook receiver for Retell AI events -- writes to Paperclip's PostgreSQL",
   "main": "index.js",
   "scripts": {

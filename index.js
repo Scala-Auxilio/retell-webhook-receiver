@@ -12,8 +12,8 @@ const RETELL_WEBHOOK_SECRET = process.env.RETELL_WEBHOOK_SECRET || null;
 const SMTP_HOST = process.env.SMTP_HOST || "smtp.zoho.eu";
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || "465");
 const SMTP_SECURE = process.env.SMTP_SECURE !== "false"; // true = SSL on 465
-const SMTP_USER = process.env.ZOHO_USER || process.env.SMTP_USER || null;
-const SMTP_PASS = process.env.ZOHO_PASS || process.env.SMTP_PASS || null;
+const SMTP_USER = process.env.ZOHO_USER || process.env.SMTP_USER || process.env.NOTIFY_FROM || null;
+const SMTP_PASS = process.env.ZOHO_PASS || process.env.SMTP_PASS || process.env.RESEND_API_KEY || null;
 const NOTIFY_FROM = process.env.NOTIFY_FROM || SMTP_USER;
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;

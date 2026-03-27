@@ -152,8 +152,11 @@ app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
-    version: "1.1.0",
+    version: "1.1.1",
     description: "Scala Auxilium — Retell AI webhook ingestion for Paperclip monitoring agents",
+    email_configured: !!transporter,
+    smtp_user_set: !!process.env.SMTP_USER,
+    smtp_pass_set: !!process.env.SMTP_PASS,
   });
 });
 

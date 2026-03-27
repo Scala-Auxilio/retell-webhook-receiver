@@ -1,15 +1,20 @@
 const express = require("express");
 const crypto = require("crypto");
 const { Pool } = require("pg");
+const nodemailer = require("nodemailer");
 
-// --- Config -----------------------------------------------------------------
+// ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const RETELL_WEBHOOK_SECRET = process.env.RETELL_WEBHOOK_SECRET || null;
 
-// --- Email Config (Resend HTTP API) -----------------------------------------
-const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
-const NOTIFY_FROM = process.env.NOTIFY_FROM || "onboarding@resend.dev";
+// ─── Email Config (Zoho SMTP) ───────────────────────────────────────────────
+const SMTP_HOST = process.env.SMTP_HOST || "smtp.zoho.eu";
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || "465");
+const SMTP_SECURE = process.env.SMTP_SECURE !== "false"; // true = SSL on 465
+const SMTP_USER = process.env.SMTP_USER || null;
+const SMTP_PASS = process.env.SMTP_PASS || null;
+const NOTIFY_FROM = process.env.NOTIFY_FROM || SMTP_USER;
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 
@@ -18,7 +23,7 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// --- PostgreSQL --------------------------------------------------------------
+// ─── PostgreSQL ───────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.DB_SSL === "false" ? false : { rejectUnauthorized: false },
@@ -27,7 +32,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000,
 });
 
-// --- Table creation on startup -----------------------------------------------
+// ─── Table creation on startup ────────────────────────────────────────────────
 async function initDatabase() {
   const client = await pool.connect();
   try {
@@ -79,33 +84,43 @@ async function initDatabase() {
   }
 }
 
-// --- Email via Resend HTTP API -----------------------------------------------
-async function sendEmail({ from, to, subject, text, html }) {
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Authorization": "Bearer " + RESEND_API_KEY,
-      "Content-Type": "application/json",
+// ─── Email via Zoho SMTP (nodemailer) ────────────────────────────────────────
+let transporter = null;
+if (SMTP_USER && SMTP_PASS) {
+  transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
     },
-    body: JSON.stringify({ from, to: [to], subject, text, html: html || undefined }),
+    tls: { rejectUnauthorized: true },
   });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.message || JSON.stringify(data));
-  }
-  return data;
+  console.log(`Email configured via Zoho SMTP (${SMTP_HOST}:${SMTP_PORT}, from: ${NOTIFY_FROM})`);
+} else {
+  console.log("Email not configured (set SMTP_USER and SMTP_PASS to enable)");
 }
 
-if (RESEND_API_KEY) {
-  console.log("Email configured via Resend API (from: " + NOTIFY_FROM + ")");
-} else {
-  console.log("Email not configured (set RESEND_API_KEY to enable)");
+async function sendEmail({ from, to, subject, text, html }) {
+  if (!transporter) {
+    throw new Error("SMTP transport not configured");
+  }
+  const info = await transporter.sendMail({
+    from: from,
+    to: to,
+    subject: subject,
+    text: text,
+    html: html || undefined,
+  });
+  return { id: info.messageId, status: "sent" };
 }
-// --- Webhook signature verification (optional) ------------------------------
+
+// ─── Webhook signature verification (optional) ───────────────────────────────
 function verifySignature(rawBody, signature) {
   if (!RETELL_WEBHOOK_SECRET) return true; // skip if no secret configured
   if (!signature) {
-    console.warn("[WARN] No x-retell-signature header present -- skipping verification.");
+    console.warn("[WARN] No x-retell-signature header present — skipping verification.");
     return true; // allow through but log warning
   }
   try {
@@ -119,7 +134,7 @@ function verifySignature(rawBody, signature) {
   }
 }
 
-// --- Express app -------------------------------------------------------------
+// ─── Express app ──────────────────────────────────────────────────────────────
 const app = express();
 
 // Capture raw body for signature verification, then parse JSON
@@ -132,13 +147,13 @@ app.use(
   })
 );
 
-// --- Health check ------------------------------------------------------------
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
     version: "1.1.0",
-    description: "Scala Auxilium -- Retell AI webhook ingestion for Paperclip monitoring agents",
+    description: "Scala Auxilium — Retell AI webhook ingestion for Paperclip monitoring agents",
   });
 });
 
@@ -151,7 +166,7 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// --- Main webhook endpoint ---------------------------------------------------
+// ─── Main webhook endpoint ────────────────────────────────────────────────────
 app.post("/webhooks/retell", async (req, res) => {
   const receivedAt = new Date().toISOString();
 
@@ -165,7 +180,7 @@ app.post("/webhooks/retell", async (req, res) => {
     if (RETELL_WEBHOOK_SECRET) {
       const signature = req.headers["x-retell-signature"];
       if (!verifySignature(req.rawBody, signature)) {
-        console.error("[ERR] [" + receivedAt + "] INVALID SIGNATURE -- event dropped.");
+        console.error(`[ERR] [${receivedAt}] INVALID SIGNATURE — event dropped.`);
         return;
       }
     }
@@ -187,23 +202,28 @@ app.post("/webhooks/retell", async (req, res) => {
     const agentLabel = agentNames[agentId] || agentId || "unknown";
 
     console.log(
-      "-> [" + receivedAt + "] " + eventType + " | agent: " + agentLabel + " | call: " + (callId || "n/a") + " | transcript: " +
-        (transcript ? transcript.length + " chars" : "none")
+      `→ [${receivedAt}] ${eventType} | agent: ${agentLabel} | call: ${callId || "n/a"} | transcript: ${
+        transcript ? transcript.length + " chars" : "none"
+      }`
     );
 
     // Write to PostgreSQL
     await pool.query(
-      "INSERT INTO retell_events (event_type, agent_id, call_id, transcript, call_analysis, full_payload, received_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+      `INSERT INTO retell_events (event_type, agent_id, call_id, transcript, call_analysis, full_payload, received_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [eventType, agentId, callId, transcript, callAnalysis ? JSON.stringify(callAnalysis) : null, JSON.stringify(payload), receivedAt]
     );
 
-    console.log("  [OK] Stored in retell_events.");
+    console.log(`  [OK] Stored in retell_events.`);
   } catch (err) {
-    console.error("  [ERR] DB write failed:", err.message);
-    console.error("  [ERR] Payload that failed to store:", JSON.stringify(req.body).substring(0, 500));
+    // DB write failed — we already returned 200 to Retell so it won't retry.
+    // Log the error and the full payload so nothing is silently lost.
+    console.error(`  [ERR] DB write failed:`, err.message);
+    console.error(`  [ERR] Payload that failed to store:`, JSON.stringify(req.body).substring(0, 500));
   }
 });
-// --- Email notification endpoint (for Paperclip agents) ---------------------
+
+// ─── Email notification endpoint (for Paperclip agents) ──────────────────────
 app.post("/notify", async (req, res) => {
   // Auth check
   if (NOTIFY_SECRET) {
@@ -213,8 +233,8 @@ app.post("/notify", async (req, res) => {
     }
   }
 
-  if (!RESEND_API_KEY) {
-    return res.status(503).json({ error: "Email not configured. Set RESEND_API_KEY." });
+  if (!transporter) {
+    return res.status(503).json({ error: "Email not configured. Set SMTP_USER and SMTP_PASS." });
   }
 
   const { subject, body, html, priority, source } = req.body;
@@ -225,7 +245,7 @@ app.post("/notify", async (req, res) => {
   // Priority prefix for subject line
   const prefixes = { critical: "CRITICAL", high: "ALERT", normal: "", low: "FYI" };
   const prefix = prefixes[priority] || "";
-  const fullSubject = prefix ? "[" + prefix + "] " + subject : subject;
+  const fullSubject = prefix ? `[${prefix}] ${subject}` : subject;
 
   try {
     await sendEmail({
@@ -238,30 +258,30 @@ app.post("/notify", async (req, res) => {
 
     // Log to database
     await pool.query(
-      "INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, $3, $4, 'sent')",
+      `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, $3, $4, 'sent')`,
       [fullSubject, body || subject, priority || "normal", source || "unknown"]
     );
 
-    console.log("Email sent: \"" + fullSubject + "\" from " + (source || "unknown"));
+    console.log(`Email sent: "${fullSubject}" from ${source || "unknown"}`);
     res.json({ sent: true, subject: fullSubject });
   } catch (err) {
     // Log failure
     await pool.query(
-      "INSERT INTO notifications (subject, body, priority, source, status, error) VALUES ($1, $2, $3, $4, 'failed', $5)",
+      `INSERT INTO notifications (subject, body, priority, source, status, error) VALUES ($1, $2, $3, $4, 'failed', $5)`,
       [fullSubject, body || subject, priority || "normal", source || "unknown", err.message]
-    ).catch(function() {});
+    ).catch(() => {});
 
     console.error("Email send failed:", err.message);
     res.status(500).json({ error: "Failed to send email", details: err.message });
   }
 });
 
-// --- Notification history endpoint ------------------------------------------
+// ─── Notification history endpoint ───────────────────────────────────────────
 app.get("/notifications", async (req, res) => {
   try {
     const { limit = 50 } = req.query;
     const result = await pool.query(
-      "SELECT * FROM notifications ORDER BY sent_at DESC LIMIT $1",
+      `SELECT * FROM notifications ORDER BY sent_at DESC LIMIT $1`,
       [Math.min(parseInt(limit) || 50, 200)]
     );
     res.json({ count: result.rows.length, notifications: result.rows });
@@ -270,40 +290,48 @@ app.get("/notifications", async (req, res) => {
   }
 });
 
-// --- Stats endpoint (useful for Paperclip agents) ---------------------------
+// ─── Stats endpoint (useful for Paperclip agents) ────────────────────────────
 app.get("/stats", async (_req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT event_type, agent_id, COUNT(*) as count, MIN(received_at) as earliest, MAX(received_at) as latest FROM retell_events GROUP BY event_type, agent_id ORDER BY latest DESC"
-    );
-    res.json({ total_events: result.rows.reduce(function(s, r) { return s + parseInt(r.count); }, 0), breakdown: result.rows });
+    const result = await pool.query(`
+      SELECT
+        event_type,
+        agent_id,
+        COUNT(*) as count,
+        MIN(received_at) as earliest,
+        MAX(received_at) as latest
+      FROM retell_events
+      GROUP BY event_type, agent_id
+      ORDER BY latest DESC
+    `);
+    res.json({ total_events: result.rows.reduce((s, r) => s + parseInt(r.count), 0), breakdown: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- Events query endpoint (for Paperclip agents to pull recent events) -----
+// ─── Events query endpoint (for Paperclip agents to pull recent events) ──────
 app.get("/events", async (req, res) => {
   try {
     const { agent_id, event_type, since, limit = 100 } = req.query;
-    var query = "SELECT * FROM retell_events WHERE 1=1";
+    let query = "SELECT * FROM retell_events WHERE 1=1";
     const params = [];
-    var paramIdx = 1;
+    let paramIdx = 1;
 
     if (agent_id) {
-      query += " AND agent_id = $" + (paramIdx++);
+      query += ` AND agent_id = $${paramIdx++}`;
       params.push(agent_id);
     }
     if (event_type) {
-      query += " AND event_type = $" + (paramIdx++);
+      query += ` AND event_type = $${paramIdx++}`;
       params.push(event_type);
     }
     if (since) {
-      query += " AND received_at >= $" + (paramIdx++);
+      query += ` AND received_at >= $${paramIdx++}`;
       params.push(since);
     }
 
-    query += " ORDER BY received_at DESC LIMIT $" + paramIdx;
+    query += ` ORDER BY received_at DESC LIMIT $${paramIdx}`;
     params.push(Math.min(parseInt(limit) || 100, 500));
 
     const result = await pool.query(query, params);
@@ -313,12 +341,27 @@ app.get("/events", async (req, res) => {
   }
 });
 
-// --- Start -------------------------------------------------------------------
+// ─── Start ────────────────────────────────────────────────────────────────────
 async function start() {
   try {
     await initDatabase();
-    app.listen(PORT, "0.0.0.0", function() {
-      console.log("Retell Webhook Receiver listening on port " + PORT);
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Retell Webhook Receiver listening on port ${PORT}`);
+      console.log(`   POST /webhooks/retell  - Retell webhook ingestion`);
+      console.log(`   POST /notify           - Send email notification`);
+      console.log(`   GET  /health           - Health check`);
+      console.log(`   GET  /stats            - Event statistics`);
+      console.log(`   GET  /events           - Query stored events`);
+      console.log(`   GET  /notifications    - Notification history`);
+      console.log(`\n   Expected agents:`);
+      console.log(`   • Aria EN (Sendsteps):  agent_aa56b68b02f6de4ac5725a829b`);
+      console.log(`   • Aria NL (Sendsteps):  agent_e1e1f763101db5abe0df281891`);
+      console.log(`   • EconoWind Chat:       agent_760482429951f50e816c47b55a`);
+      if (RETELL_WEBHOOK_SECRET) {
+        console.log(`\n   [OK] Webhook signature verification ENABLED`);
+      } else {
+        console.log(`\n   [WARN] Webhook signature verification DISABLED (set RETELL_WEBHOOK_SECRET to enable)`);
+      }
     });
   } catch (err) {
     console.error("Failed to start:", err);

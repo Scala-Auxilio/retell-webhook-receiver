@@ -1,20 +1,15 @@
 const express = require("express");
 const crypto = require("crypto");
 const { Pool } = require("pg");
-const nodemailer = require("nodemailer");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const RETELL_WEBHOOK_SECRET = process.env.RETELL_WEBHOOK_SECRET || null;
 
-// ─── Email Config (Zoho SMTP) ───────────────────────────────────────────────
-const SMTP_HOST = process.env.SMTP_HOST || "smtp.zoho.eu";
-const SMTP_PORT = parseInt(process.env.SMTP_PORT || "465");
-const SMTP_SECURE = process.env.SMTP_SECURE !== "false"; // true = SSL on 465
-const SMTP_USER = process.env.ZOHO_USER || process.env.SMTP_USER || process.env.NOTIFY_FROM || null;
-const SMTP_PASS = process.env.ZOHO_PASS || process.env.SMTP_PASS || process.env.RESEND_API_KEY || null;
-const NOTIFY_FROM = process.env.NOTIFY_FROM || SMTP_USER;
+// ─── Email Config (Resend HTTP API) ─────────────────────────────────────────
+const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+const NOTIFY_FROM = process.env.NOTIFY_FROM || "notifications@adsum-auxilio.com";
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 
@@ -84,36 +79,37 @@ async function initDatabase() {
   }
 }
 
-// ─── Email via Zoho SMTP (nodemailer) ────────────────────────────────────────
-let transporter = null;
-if (SMTP_USER && SMTP_PASS) {
-  transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-    tls: { rejectUnauthorized: true },
-  });
-  console.log(`Email configured via Zoho SMTP (${SMTP_HOST}:${SMTP_PORT}, from: ${NOTIFY_FROM})`);
+// ─── Email via Resend HTTP API ───────────────────────────────────────────────
+if (RESEND_API_KEY) {
+  console.log(`Email configured via Resend API (from: ${NOTIFY_FROM}, to: ${NOTIFY_TO})`);
 } else {
-  console.log("Email not configured (set SMTP_USER and SMTP_PASS to enable)");
+  console.log("Email not configured (set RESEND_API_KEY to enable)");
 }
 
 async function sendEmail({ from, to, subject, text, html }) {
-  if (!transporter) {
-    throw new Error("SMTP transport not configured");
+  if (!RESEND_API_KEY) {
+    throw new Error("Resend API key not configured");
   }
-  const info = await transporter.sendMail({
-    from: from,
-    to: to,
-    subject: subject,
-    text: text,
-    html: html || undefined,
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: from,
+      to: Array.isArray(to) ? to : [to],
+      subject: subject,
+      text: text,
+      html: html || undefined,
+    }),
   });
-  return { id: info.messageId, status: "sent" };
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(`Resend API error ${resp.status}: ${err.message || resp.statusText}`);
+  }
+  const data = await resp.json();
+  return { id: data.id, status: "sent" };
 }
 
 // ─── Webhook signature verification (optional) ───────────────────────────────
@@ -152,11 +148,8 @@ app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
-    version: "1.1.1",
+    version: "1.2.0",
     description: "Scala Auxilium — Retell AI webhook ingestion for Paperclip monitoring agents",
-    email_configured: !!transporter,
-    smtp_user_set: !!process.env.SMTP_USER,
-    smtp_pass_set: !!process.env.SMTP_PASS,
   });
 });
 
@@ -236,8 +229,8 @@ app.post("/notify", async (req, res) => {
     }
   }
 
-  if (!transporter) {
-    return res.status(503).json({ error: "Email not configured. Set SMTP_USER and SMTP_PASS." });
+  if (!RESEND_API_KEY) {
+    return res.status(503).json({ error: "Email not configured. Set RESEND_API_KEY." });
   }
 
   const { subject, body, html, priority, source } = req.body;

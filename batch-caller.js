@@ -34,7 +34,7 @@ const AGENTS = {
   },
 };
 
-// CET calling window: Mon–Fri 09:00–17:00
+// CET calling window: Mon–Sat 09:00–17:00 (Sat added temporarily for testing)
 const CALLING_WINDOW = {
   timezone: "Europe/Amsterdam",
   windows: [
@@ -43,6 +43,7 @@ const CALLING_WINDOW = {
     { day: 3, start_min: 540, end_min: 1020 }, // Wed
     { day: 4, start_min: 540, end_min: 1020 }, // Thu
     { day: 5, start_min: 540, end_min: 1020 }, // Fri
+    { day: 6, start_min: 540, end_min: 1020 }, // Sat (TEMP — remove after testing)
   ],
 };
 

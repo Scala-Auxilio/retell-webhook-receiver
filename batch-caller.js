@@ -34,7 +34,7 @@ const AGENTS = {
   },
 };
 
-// CET calling window: Mon–Sat 09:00–17:00 (Sat added temporarily for testing)
+// CET calling window: Mon–Fri 09:00–17:00
 const CALLING_WINDOW = {
   timezone: "Europe/Amsterdam",
   windows: [
@@ -43,7 +43,6 @@ const CALLING_WINDOW = {
     { day: 3, start_min: 540, end_min: 1020 }, // Wed
     { day: 4, start_min: 540, end_min: 1020 }, // Thu
     { day: 5, start_min: 540, end_min: 1020 }, // Fri
-    { day: 6, start_min: 540, end_min: 1020 }, // Sat (TEMP — remove after testing)
   ],
 };
 
@@ -70,7 +69,8 @@ function mapZohoLead(zohoLead) {
     sendsteps_product: zohoLead.Sendsteps_Product || zohoLead.sendsteps_product || "Interactive Presentations",
     notes: zohoLead.Description || zohoLead.description || "",
     // Zoho metadata (preserved for status callback)
-    zoho_lead_id: zohoLead.id || zohoLead.Id || zohoLead.lead_id || null,
+    // Zoho Flow merge fields may send as "id", "Id", "lead_id", "Lead_Id", or "LEADID"
+    zoho_lead_id: zohoLead.id || zohoLead.Id || zohoLead.lead_id || zohoLead.Lead_Id || zohoLead.LEADID || zohoLead.Lead_ID || null,
     edu_level: eduLevel,
     type_of_plan: zohoLead.Type_of_Plan || zohoLead.type_of_plan || "",
     language: zohoLead.Language || zohoLead.language || "",

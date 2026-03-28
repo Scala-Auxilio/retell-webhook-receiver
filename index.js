@@ -125,6 +125,9 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_econowind_leads_received ON econowind_leads (received_at);
     `);
     console.log("Database table econowind_leads ready.");
+
+    // Interaction scores table (for Paperclip Interaction Scorer agent)
+    await scorer.initScorerTable(pool);
   } finally {
     client.release();
   }
@@ -633,6 +636,14 @@ app.post("/webhooks/econowind", async (req, res) => {
   }
 });
 
+// ─── TidyCal Integration (live booking for Retell agents) ───────────────────
+const tidycal = require("./tidycal");
+tidycal.registerRoutes(app);
+
+// ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
+const scorer = require("./interaction-scorer");
+scorer.registerRoutes(app, pool);
+
 // ─── Zoho CRM → Aria Pipeline Endpoint ──────────────────────────────────────
 const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 
@@ -710,6 +721,9 @@ app.post("/zoho/aria-trigger", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", details: errors, zoho_lead_id: prospect.zoho_lead_id });
   }
 
+  if (!prospect.zoho_lead_id) {
+    console.warn(`[ZOHO] WARNING: zoho_lead_id is null — Zoho Flow webhook body may not include 'id' or 'lead_id'. Received keys: ${Object.keys(zohoLead).join(", ")}`);
+  }
   console.log(`→ [ZOHO] Aria trigger: ${prospect.contact_name} @ ${prospect.university_name} → ${agentKey} (lead: ${prospect.zoho_lead_id})`);
 
   try {
@@ -796,7 +810,7 @@ async function start() {
   try {
     await initDatabase();
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Retell Webhook Receiver v1.3.0 listening on port ${PORT}`);
+      console.log(`Retell Webhook Receiver v1.4.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);
       console.log(`   POST /webhooks/econowind  - EconoWind lead notification routing`);
       console.log(`   POST /notify              - Send email notification`);
@@ -809,6 +823,14 @@ async function start() {
       console.log(`   GET  /batch-call/agents   - Available batch call agents`);
       console.log(`   POST /zoho/aria-trigger   - Zoho Flow → Aria call pipeline`);
       console.log(`   POST /zoho/aria-result    - Call result callback for Zoho`);
+      console.log(`   GET  /tidycal/availability - TidyCal slot check (Retell custom fn)`);
+      console.log(`   POST /tidycal/book        - TidyCal booking create (Retell custom fn)`);
+      console.log(`   GET  /tidycal/status       - TidyCal integration health check`);
+      console.log(`   GET  /scorer/rubric       - Interaction scoring rubric`);
+      console.log(`   GET  /scorer/unscored     - Unscored calls for Interaction Scorer`);
+      console.log(`   POST /scorer/score        - Submit interaction score`);
+      console.log(`   GET  /scorer/scores       - Query scored interactions`);
+      console.log(`   GET  /scorer/summary      - Aggregate scoring summary`);
       console.log(`\n   Expected agents:`);
       console.log(`   • Aria EN (Sendsteps):  agent_aa56b68b02f6de4ac5725a829b`);
       console.log(`   • Aria NL (Sendsteps):  agent_e1e1f763101db5abe0df281891`);

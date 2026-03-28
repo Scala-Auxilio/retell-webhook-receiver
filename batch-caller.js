@@ -25,8 +25,7 @@ const AGENTS = {
   aria_en: {
     agent_id: "agent_aa56b68b02f6de4ac5725a829b",
     label: "Aria EN (Sendsteps)",
-    from_number: process.env.ARIA_EN_FROM_NUMBER || null, // Set in env, e.g. +312071636XX
-  },
+    from_number: process.env.ARIA_EN_FROM_NUMBER || null, // Set in env, e.g. +312071636XX  },
   aria_nl: {
     agent_id: "agent_e1e1f763101db5abe0df281891",
     label: "Aria NL (Sendsteps)",
@@ -55,8 +54,7 @@ function mapZohoLead(zohoLead) {
     university_name: zohoLead.Educational_Institute || zohoLead.Educational_institute || zohoLead.Company || zohoLead.company || "",
     contact_name: [zohoLead.First_Name || zohoLead.first_name || "", zohoLead.Last_Name || zohoLead.last_name || ""].filter(Boolean).join(" "),
     contact_title: zohoLead.Job_Title_Edu || zohoLead.Job_Title_Business || zohoLead.job_title_edu || "",
-    department: zohoLead.Segment || zohoLead.segment || "",
-    country: zohoLead.Country || zohoLead.country || "",
+    department: zohoLead.Segment || zohoLead.segment || "",    country: zohoLead.Country || zohoLead.country || "",
     sendsteps_product: zohoLead.Sendsteps_Product || zohoLead.sendsteps_product || "Interactive Presentations",
     notes: zohoLead.Description || zohoLead.description || "",
     // Zoho metadata (preserved for status callback)
@@ -84,8 +82,7 @@ function validateE164(phone) {
 
 function validateProspect(prospect, index) {
   const errors = [];
-  if (!prospect.phone_number) errors.push(`Row ${index}: missing phone_number`);
-  else if (!validateE164(prospect.phone_number)) errors.push(`Row ${index}: invalid E.164 format '${prospect.phone_number}' — must be +[country][number]`);
+  if (!prospect.phone_number) errors.push(`Row ${index}: missing phone_number`);  else if (!validateE164(prospect.phone_number)) errors.push(`Row ${index}: invalid E.164 format '${prospect.phone_number}' — must be +[country][number]`);
   if (!prospect.university_name && !prospect.contact_name) errors.push(`Row ${index}: need at least university_name or contact_name`);
   return errors;
 }
@@ -112,17 +109,16 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
   const payload = {
     from_number: agent.from_number,
     tasks,
-    name: options.name || `Sendsteps ${agentKey.toUpperCase()} batch — ${new Date().toISOString().split("T")[0]}`,
-  };
+    name: options.name || `Sendsteps ${agentKey.toUpperCase()} batch — ${new Date().toISOString().split("T")[0]}`,  };
 
   // Add calling window
   if (!options.skip_window) {
     payload.call_time_window = {
       timezone: CALLING_WINDOW.timezone,
       windows: CALLING_WINDOW.windows.map((w) => ({
-        day_of_week: w.day,
-        start_minute: w.start_min,
-        end_minute: w.end_min,
+        day: [w.day],
+        start: w.start_min,
+        end: w.end_min,
       })),
     };
   }
@@ -142,8 +138,7 @@ async function createBatchCall(prospects, options = {}) {
 
   // Validate all prospects
   const allErrors = [];
-  prospects.forEach((p, i) => allErrors.push(...validateProspect(p, i + 1)));
-  if (allErrors.length > 0) {
+  prospects.forEach((p, i) => allErrors.push(...validateProspect(p, i + 1)));  if (allErrors.length > 0) {
     return { success: false, errors: allErrors };
   }
 
@@ -171,8 +166,7 @@ async function createBatchCall(prospects, options = {}) {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${RETELL_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+      "Content-Type": "application/json",    },
     body: JSON.stringify(payload),
   });
 
@@ -201,7 +195,6 @@ function parseProspectList(filePath) {
 }
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
-
 async function main() {
   const args = process.argv.slice(2);
   const fileIdx = args.indexOf("--file");
@@ -230,8 +223,7 @@ async function main() {
   }
 
   console.log(`Loading prospects from ${filePath}...`);
-  const prospects = parseProspectList(filePath);
-  console.log(`Found ${prospects.length} prospects for ${agentKey}`);
+  const prospects = parseProspectList(filePath);  console.log(`Found ${prospects.length} prospects for ${agentKey}`);
 
   try {
     const result = await createBatchCall(prospects, {

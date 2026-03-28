@@ -18,7 +18,7 @@ const path = require("path");
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const RETELL_API_KEY = process.env.RETELL_API_KEY || null;
-const RETELL_API_BASE = "https://api.retellai.com/v2";
+const RETELL_API_BASE = "https://api.retellai.com";
 
 // Agent configs — maps friendly names to Retell agent IDs and phone numbers
 const AGENTS = {

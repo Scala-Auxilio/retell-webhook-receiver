@@ -80,19 +80,27 @@ function mapZohoLead(zohoLead) {
 // Derive persona_type for Retell agent (Opener/Qualify/Pitch branch on this)
 // Values used in agent flow: "faculty", "procurement"
 function derivePersonaType(eduLevel, jobTitle) {
-  const combined = `${eduLevel} ${jobTitle}`.toLowerCase();
+  const combined = `${eduLevel} ${jobTitle}`;
   if (/procure|purchas|inkoop|buyer|tender/i.test(combined)) return "procurement";
-  if (/it\b|ict|tech|system|infra/i.test(combined)) return "procurement";
+  // "IT" and "ICT" must be uppercase (case-sensitive) to avoid matching "it" in titles
+  // tech/system admin/infra are case-insensitive
+  if (/\bIT\b|\bICT\b/.test(combined)) return "procurement";
+  if (/\btech\b|system\s*admin|infra/i.test(combined)) return "procurement";
   // Default to faculty for educators, professors, lecturers, deans, etc.
   return "faculty";
 }
 
 // Determine agent from Zoho lead's Aria_Status field
+// Matches: "Ready for Aria EN", "Aria EN", "Retry Aria EN", etc.
 function agentFromAriaStatus(ariaStatus) {
   if (!ariaStatus) return null;
-  const s = ariaStatus.toLowerCase();
-  if (s.includes("en")) return "aria_en";
-  if (s.includes("nl")) return "aria_nl";
+  const s = ariaStatus.toLowerCase().trim();
+  // Match "aria en" or status ending in " en" (but not words like "pending")
+  if (/\baria[_ ]en\b/.test(s) || s === "ready for aria en" || s === "retry aria en") return "aria_en";
+  if (/\baria[_ ]nl\b/.test(s) || s === "ready for aria nl" || s === "retry aria nl") return "aria_nl";
+  // Fallback: check for isolated "en"/"nl" at end of string (e.g. "Queue EN")
+  if (/\ben$/.test(s)) return "aria_en";
+  if (/\bnl$/.test(s)) return "aria_nl";
   return null;
 }
 

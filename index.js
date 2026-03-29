@@ -1,6 +1,9 @@
 const express = require("express");
 const crypto = require("crypto");
 const { Pool } = require("pg");
+const tidycal = require("./tidycal");
+const scorer = require("./interaction-scorer");
+const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -211,6 +214,16 @@ app.use(
   })
 );
 
+// ─── Auth middleware (reusable across protected endpoints) ────────────────────
+function requireAuth(req, res, next) {
+  if (!NOTIFY_SECRET) return next(); // no secret configured, allow all
+  const auth = req.headers["x-notify-secret"] || req.body.secret;
+  if (auth !== NOTIFY_SECRET) {
+    return res.status(401).json({ error: "Invalid or missing secret" });
+  }
+  next();
+}
+
 // ─── Business hours endpoint (for Retell custom functions / transfer logic) ──
 app.get("/business-hours", (_req, res) => {
   const open = isBusinessHours();
@@ -229,7 +242,7 @@ app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
-    version: "1.3.0",
+    version: "1.5.0",
     description: "Scala Auxilium — Retell AI webhook ingestion for Paperclip monitoring agents",
   });
 });
@@ -301,15 +314,7 @@ app.post("/webhooks/retell", async (req, res) => {
 });
 
 // ─── Email notification endpoint (for Paperclip agents) ──────────────────────
-app.post("/notify", async (req, res) => {
-  // Auth check
-  if (NOTIFY_SECRET) {
-    const auth = req.headers["x-notify-secret"] || req.body.secret;
-    if (auth !== NOTIFY_SECRET) {
-      return res.status(401).json({ error: "Invalid or missing secret" });
-    }
-  }
-
+app.post("/notify", requireAuth, async (req, res) => {
   if (!RESEND_API_KEY) {
     return res.status(503).json({ error: "Email not configured. Set RESEND_API_KEY." });
   }
@@ -527,17 +532,8 @@ function buildLeadEmailHtml(lead, priorityInfo, manager) {
 }
 
 // ─── EconoWind Lead Notification Endpoint ───────────────────────────────────
-app.post("/webhooks/econowind", async (req, res) => {
+app.post("/webhooks/econowind", requireAuth, async (req, res) => {
   const receivedAt = new Date().toISOString();
-
-  // Auth check (reuse NOTIFY_SECRET)
-  if (NOTIFY_SECRET) {
-    const auth = req.headers["x-notify-secret"] || req.body.secret;
-    if (auth !== NOTIFY_SECRET) {
-      return res.status(401).json({ error: "Invalid or missing secret" });
-    }
-  }
-
   const lead = req.body;
 
   // Validate minimum required fields
@@ -637,25 +633,14 @@ app.post("/webhooks/econowind", async (req, res) => {
 });
 
 // ─── TidyCal Integration (live booking for Retell agents) ───────────────────
-const tidycal = require("./tidycal");
 tidycal.registerRoutes(app);
 
 // ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
-const scorer = require("./interaction-scorer");
 scorer.registerRoutes(app, pool);
 
 // ─── Zoho CRM → Aria Pipeline Endpoint ──────────────────────────────────────
-const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 
-app.post("/batch-call", async (req, res) => {
-  // Auth check
-  if (NOTIFY_SECRET) {
-    const auth = req.headers["x-notify-secret"] || req.body.secret;
-    if (auth !== NOTIFY_SECRET) {
-      return res.status(401).json({ error: "Invalid or missing secret" });
-    }
-  }
-
+app.post("/batch-call", requireAuth, async (req, res) => {
   const { prospects, agent, dry_run, scheduled_time } = req.body;
   if (!prospects || !Array.isArray(prospects) || prospects.length === 0) {
     return res.status(400).json({ error: "Missing or empty 'prospects' array" });
@@ -690,15 +675,7 @@ app.get("/batch-call/agents", (_req, res) => {
 });
 
 // ─── Zoho Flow → Aria Pipeline (triggered when Aria_Status changes) ─────────
-app.post("/zoho/aria-trigger", async (req, res) => {
-  // Auth check
-  if (NOTIFY_SECRET) {
-    const auth = req.headers["x-notify-secret"] || req.body.secret;
-    if (auth !== NOTIFY_SECRET) {
-      return res.status(401).json({ error: "Invalid or missing secret" });
-    }
-  }
-
+app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   const zohoLead = req.body;
   const ariaStatus = zohoLead.Aria_Status || zohoLead.aria_status;
 
@@ -756,15 +733,9 @@ app.post("/zoho/aria-trigger", async (req, res) => {
 });
 
 // ─── Zoho CRM Status Callback (update lead after call completes) ────────────
-app.post("/zoho/aria-result", async (req, res) => {
+app.post("/zoho/aria-result", requireAuth, async (req, res) => {
   // This endpoint receives call results and can be used to update Zoho CRM via API
   // For now, it logs the result. Phase 2 (May) will use Zoho CRM API to update the lead.
-  if (NOTIFY_SECRET) {
-    const auth = req.headers["x-notify-secret"] || req.body.secret;
-    if (auth !== NOTIFY_SECRET) {
-      return res.status(401).json({ error: "Invalid or missing secret" });
-    }
-  }
 
   const { zoho_lead_id, call_id, status, transcript_summary } = req.body;
   console.log(`→ [ZOHO] Aria result: lead=${zoho_lead_id} call=${call_id} status=${status}`);
@@ -810,7 +781,7 @@ async function start() {
   try {
     await initDatabase();
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Retell Webhook Receiver v1.4.0 listening on port ${PORT}`);
+      console.log(`Retell Webhook Receiver v1.5.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);
       console.log(`   POST /webhooks/econowind  - EconoWind lead notification routing`);
       console.log(`   POST /notify              - Send email notification`);

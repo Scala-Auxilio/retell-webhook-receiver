@@ -1,0 +1,480 @@
+/**
+ * Scala Auxilium — Calendly Integration Module
+ *
+ * Proxy endpoints for Retell AI agents to check availability
+ * and book meetings via Calendly API v2 during live calls.
+ *
+ * Calendly API docs: https://developer.calendly.com/api-docs
+ *
+ * Environment variables:
+ *   CALENDLY_API_TOKEN           – Personal Access Token (from Integrations → API)
+ *   CALENDLY_EVENT_TYPE_ROGIER   – Event type URI for Rogier (e.g., https://api.calendly.com/event_types/XXXXX)
+ *   CALENDLY_EVENT_TYPE_MIKE     – Event type URI for Mike
+ *   CALENDLY_FALLBACK_URL_ROGIER – Public booking page URL for Rogier (fallback)
+ *   CALENDLY_FALLBACK_URL_MIKE   – Public booking page URL for Mike (fallback)
+ *
+ * Retell Custom Function integration:
+ *   These endpoints are called from Retell agent flow nodes via
+ *   the "Custom Function" (webhook) action during a live call.
+ */
+
+const CALENDLY_API_BASE = "https://api.calendly.com";
+const CALENDLY_API_TOKEN = process.env.CALENDLY_API_TOKEN || null;
+
+// ─── Specialist Config ──────────────────────────────────────────────────────
+
+const SPECIALISTS = {
+  rogier: {
+    name: "Rogier",
+    event_type_uri: process.env.CALENDLY_EVENT_TYPE_ROGIER || null,
+    fallback_url: process.env.CALENDLY_FALLBACK_URL_ROGIER || "https://calendly.com/sendsteps/rogier-demo",
+  },
+  mike: {
+    name: "Mike",
+    event_type_uri: process.env.CALENDLY_EVENT_TYPE_MIKE || null,
+    fallback_url: process.env.CALENDLY_FALLBACK_URL_MIKE || "https://calendly.com/sendsteps/mike-demo",
+  },
+};
+
+// Cache for resolved event type URIs (populated on first request or startup)
+let _eventTypeCache = null;
+let _userUri = null;
+
+// ─── Calendly API helpers ────────────────────────────────────────────────────
+
+async function calendlyFetch(endpoint, options = {}) {
+  if (!CALENDLY_API_TOKEN) {
+    throw new Error("CALENDLY_API_TOKEN not configured. Set it in Railway env vars.");
+  }
+
+  const url = endpoint.startsWith("http") ? endpoint : `${CALENDLY_API_BASE}${endpoint}`;
+  const resp = await fetch(url, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${CALENDLY_API_TOKEN}`,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => "Unknown error");
+    throw new Error(`Calendly API ${resp.status}: ${err}`);
+  }
+
+  return resp.json();
+}
+
+/**
+ * Get current user URI (needed to list event types).
+ * Cached after first call.
+ */
+async function getUserUri() {
+  if (_userUri) return _userUri;
+  const data = await calendlyFetch("/users/me");
+  _userUri = data.resource.uri;
+  return _userUri;
+}
+
+/**
+ * Auto-discover event type URIs by matching on name/slug.
+ * Called on first request if env vars aren't set.
+ */
+async function resolveEventTypes() {
+  if (_eventTypeCache) return _eventTypeCache;
+
+  const userUri = await getUserUri();
+  const data = await calendlyFetch(`/event_types?user=${encodeURIComponent(userUri)}&active=true`);
+
+  _eventTypeCache = {};
+  for (const et of data.collection || []) {
+    _eventTypeCache[et.uri] = {
+      uri: et.uri,
+      name: et.name,
+      slug: et.slug,
+      duration: et.duration,
+      scheduling_url: et.scheduling_url,
+    };
+  }
+
+  // Try to auto-match specialists by name if env vars not set
+  for (const [key, spec] of Object.entries(SPECIALISTS)) {
+    if (!spec.event_type_uri) {
+      const match = Object.values(_eventTypeCache).find(
+        (et) => et.name.toLowerCase().includes(key) || et.slug.toLowerCase().includes(key)
+      );
+      if (match) {
+        spec.event_type_uri = match.uri;
+        console.log(`[CALENDLY] Auto-matched ${key} → ${match.name} (${match.uri})`);
+      }
+    }
+  }
+
+  return _eventTypeCache;
+}
+
+// ─── Default specialist routing ──────────────────────────────────────────────
+
+function getDefaultSpecialist() {
+  // Both Rogier and Mike handle EN and NL — round-robin or pick whoever has
+  // availability sooner. For now, default to Rogier.
+  return "rogier";
+}
+
+// ─── Availability Check ──────────────────────────────────────────────────────
+
+/**
+ * Get available time slots for a specialist's event type.
+ *
+ * @param {string} eventTypeUri - Calendly event type URI
+ * @param {string} startDate - ISO date string (YYYY-MM-DD), defaults to tomorrow
+ * @param {number} days - Number of days to look ahead (default: 5, max: 7)
+ * @returns {Object} Available slots from Calendly API
+ */
+async function getAvailability(eventTypeUri, startDate, days = 5) {
+  if (!eventTypeUri) {
+    throw new Error("Event type URI not configured");
+  }
+
+  // Default to tomorrow
+  if (!startDate) {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    startDate = tomorrow.toISOString().split("T")[0];
+  }
+
+  // Calendly allows max 7 days per request
+  days = Math.min(days, 7);
+  const end = new Date(startDate);
+  end.setDate(end.getDate() + days);
+
+  const startTime = `${startDate}T00:00:00Z`;
+  const endTime = end.toISOString().split("T")[0] + "T23:59:59Z";
+
+  const data = await calendlyFetch(
+    `/event_type_available_times?event_type=${encodeURIComponent(eventTypeUri)}&start_time=${startTime}&end_time=${endTime}`
+  );
+
+  return data;
+}
+
+/**
+ * Format available slots into a human-readable list for Aria to read aloud.
+ * Returns the 3 nearest available slots as a conversational string.
+ *
+ * @param {Object} availabilityData - Calendly API response from event_type_available_times
+ * @param {string} timezone - Display timezone (default: Europe/Amsterdam)
+ * @returns {Object} { slots: Array, spoken: string, spoken_nl: string, count: number }
+ */
+function formatSlotsForVoice(availabilityData, timezone = "Europe/Amsterdam") {
+  const allSlots = [];
+
+  // Calendly returns { collection: [ { status: "available", start_time: "...", invitees_remaining: N, scheduling_url: "..." } ] }
+  const collection = availabilityData.collection || [];
+
+  for (const slot of collection) {
+    if (slot.status === "available" && slot.invitees_remaining > 0) {
+      allSlots.push({
+        start_time: slot.start_time,
+        scheduling_url: slot.scheduling_url,
+      });
+    }
+  }
+
+  // Take first 3 slots
+  const topSlots = allSlots.slice(0, 3);
+
+  if (topSlots.length === 0) {
+    return {
+      slots: [],
+      spoken: "I don't see any available slots in the next few days. Let me send you a booking link by email instead so you can pick a time that works.",
+      spoken_nl: "Ik zie geen beschikbare tijdsloten in de komende dagen. Laat me u een boekingslink per e-mail sturen zodat u zelf een geschikt moment kunt kiezen.",
+      count: 0,
+    };
+  }
+
+  // Format for voice
+  const dateFormatter = new Intl.DateTimeFormat("en-GB", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    timeZone: timezone,
+  });
+  const dateFormatterNL = new Intl.DateTimeFormat("nl-NL", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    timeZone: timezone,
+  });
+
+  const spokenParts = topSlots.map((s) => {
+    const dt = new Date(s.start_time);
+    const dayStr = dateFormatter.format(dt);
+    const timeStr = dt.toLocaleTimeString("en-GB", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: timezone });
+    return `${dayStr} at ${timeStr}`;
+  });
+
+  const spokenPartsNL = topSlots.map((s) => {
+    const dt = new Date(s.start_time);
+    const dayStr = dateFormatterNL.format(dt);
+    const timeStr = dt.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit", timeZone: timezone });
+    return `${dayStr} om ${timeStr}`;
+  });
+
+  let spoken, spoken_nl;
+  if (spokenParts.length === 1) {
+    spoken = `I have ${spokenParts[0]} available. Would that work for you?`;
+    spoken_nl = `Ik heb ${spokenPartsNL[0]} beschikbaar. Zou dat schikken?`;
+  } else if (spokenParts.length === 2) {
+    spoken = `I have ${spokenParts[0]} or ${spokenParts[1]}. Which works better for you?`;
+    spoken_nl = `Ik heb ${spokenPartsNL[0]} of ${spokenPartsNL[1]}. Welke past u beter?`;
+  } else {
+    spoken = `I have ${spokenParts[0]}, ${spokenParts[1]}, or ${spokenParts[2]}. Which works best for you?`;
+    spoken_nl = `Ik heb ${spokenPartsNL[0]}, ${spokenPartsNL[1]}, of ${spokenPartsNL[2]}. Welke past u het beste?`;
+  }
+
+  return {
+    slots: topSlots.map((s) => ({
+      start_time: s.start_time,
+      scheduling_url: s.scheduling_url,
+    })),
+    spoken,
+    spoken_nl,
+    count: topSlots.length,
+  };
+}
+
+// ─── Booking ─────────────────────────────────────────────────────────────────
+
+/**
+ * Create a booking via Calendly Scheduling API (Create Event Invitee).
+ *
+ * @param {string} eventTypeUri - Calendly event type URI
+ * @param {Object} details - { name, email, start_time, timezone, notes }
+ * @returns {Object} Booking confirmation from Calendly
+ */
+async function createBooking(eventTypeUri, details) {
+  if (!eventTypeUri) {
+    throw new Error("Event type URI not configured");
+  }
+
+  const payload = {
+    event_type: eventTypeUri,
+    start_time: details.start_time, // UTC ISO 8601
+    invitee: {
+      name: details.name || "Prospect",
+      email: details.email,
+    },
+  };
+
+  // Add timezone if provided
+  if (details.timezone) {
+    payload.invitee.timezone = details.timezone;
+  }
+
+  const data = await calendlyFetch("/invitees", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  return data;
+}
+
+// ─── Express route handlers ──────────────────────────────────────────────────
+
+function registerRoutes(app) {
+
+  /**
+   * GET /calendly/availability
+   *
+   * Called by Retell Custom Function during a live call.
+   * Returns available time slots formatted for voice.
+   *
+   * Query params:
+   *   specialist - "rogier" or "mike" (optional, defaults to rogier)
+   *   language   - "en" or "nl" (for voice format)
+   *   start_date - YYYY-MM-DD (optional, defaults to tomorrow)
+   *   days       - number of days to look ahead (default: 5, max: 7)
+   */
+  app.get("/calendly/availability", async (req, res) => {
+    try {
+      const { specialist, language, start_date, days } = req.query;
+
+      // Ensure event types are resolved
+      await resolveEventTypes();
+
+      const specKey = specialist || getDefaultSpecialist();
+      const spec = SPECIALISTS[specKey];
+
+      if (!spec) {
+        return res.status(400).json({ error: `Unknown specialist: '${specKey}'. Use: ${Object.keys(SPECIALISTS).join(", ")}` });
+      }
+
+      if (!spec.event_type_uri) {
+        // Calendly event type not configured — return fallback
+        console.log(`[CALENDLY] Event type not configured for ${specKey}, returning fallback URL`);
+        return res.json({
+          available: false,
+          fallback: true,
+          fallback_url: spec.fallback_url,
+          spoken: `I'll send you a calendar link by email so you can pick a time that suits you best.`,
+          spoken_nl: `Ik stuur u een agenda-link per e-mail zodat u zelf het beste moment kunt kiezen.`,
+          specialist: spec.name,
+        });
+      }
+
+      console.log(`[CALENDLY] Checking availability for ${spec.name}...`);
+      const availability = await getAvailability(spec.event_type_uri, start_date, parseInt(days) || 5);
+      const formatted = formatSlotsForVoice(availability);
+
+      res.json({
+        available: formatted.count > 0,
+        fallback: formatted.count === 0,
+        fallback_url: formatted.count === 0 ? spec.fallback_url : null,
+        specialist: spec.name,
+        ...formatted,
+      });
+    } catch (err) {
+      console.error("[CALENDLY] Availability check failed:", err.message);
+      // On error, fall back to email-based booking
+      const specKey = req.query.specialist || getDefaultSpecialist();
+      const spec = SPECIALISTS[specKey] || SPECIALISTS.rogier;
+      res.json({
+        available: false,
+        fallback: true,
+        fallback_url: spec.fallback_url,
+        spoken: `I'll send you a calendar link by email so you can pick a time that suits you best.`,
+        spoken_nl: `Ik stuur u een agenda-link per e-mail zodat u zelf het beste moment kunt kiezen.`,
+        specialist: spec.name,
+        error: err.message,
+      });
+    }
+  });
+
+  /**
+   * POST /calendly/book
+   *
+   * Called by Retell Custom Function to confirm a booking.
+   *
+   * Body:
+   *   specialist  - "rogier" or "mike"
+   *   start_time  - ISO 8601 datetime (UTC) selected by prospect
+   *   name        - Prospect name
+   *   email       - Prospect email
+   *   timezone    - Prospect timezone (default: Europe/Amsterdam)
+   *   notes       - Optional notes
+   *   language    - "en" or "nl" (for voice response)
+   */
+  app.post("/calendly/book", async (req, res) => {
+    try {
+      const { specialist, start_time, name, email, timezone, notes, language } = req.body;
+
+      if (!start_time) {
+        return res.status(400).json({ error: "Missing start_time" });
+      }
+      if (!email) {
+        return res.status(400).json({ error: "Missing email" });
+      }
+
+      // Ensure event types are resolved
+      await resolveEventTypes();
+
+      const specKey = specialist || getDefaultSpecialist();
+      const spec = SPECIALISTS[specKey];
+
+      if (!spec || !spec.event_type_uri) {
+        // Can't book without configured event type — return fallback
+        const fallbackSpec = spec || SPECIALISTS.rogier;
+        return res.json({
+          booked: false,
+          fallback: true,
+          fallback_url: fallbackSpec.fallback_url,
+          spoken: `I wasn't able to book that slot directly. I'll send you a calendar link by email instead.`,
+          spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
+        });
+      }
+
+      console.log(`[CALENDLY] Booking ${name} with ${spec.name} at ${start_time}...`);
+      const booking = await createBooking(spec.event_type_uri, {
+        name: name || "Prospect",
+        email,
+        start_time,
+        timezone: timezone || "Europe/Amsterdam",
+        notes: notes || `Booked by Aria (AI SDR) during outbound call`,
+      });
+
+      // Format confirmation for voice
+      const tz = timezone || "Europe/Amsterdam";
+      const dt = new Date(start_time);
+      const dateStr = dt.toLocaleDateString("en-GB", { weekday: "long", month: "long", day: "numeric", timeZone: tz });
+      const timeStr = dt.toLocaleTimeString("en-GB", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: tz });
+      const dateStrNL = dt.toLocaleDateString("nl-NL", { weekday: "long", month: "long", day: "numeric", timeZone: tz });
+      const timeStrNL = dt.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit", timeZone: tz });
+
+      res.json({
+        booked: true,
+        booking_uri: booking.resource?.uri || null,
+        event_uri: booking.resource?.event || null,
+        specialist: spec.name,
+        datetime: start_time,
+        spoken: `You're all set. I've booked your demo with ${spec.name} for ${dateStr} at ${timeStr}. You'll receive a calendar invite at ${email} shortly.`,
+        spoken_nl: `Het is geregeld. Ik heb uw demo met ${spec.name} ingepland op ${dateStrNL} om ${timeStrNL}. U ontvangt binnenkort een agenda-uitnodiging op ${email}.`,
+      });
+    } catch (err) {
+      console.error("[CALENDLY] Booking failed:", err.message);
+      const specKey = req.body.specialist || getDefaultSpecialist();
+      const spec = SPECIALISTS[specKey] || SPECIALISTS.rogier;
+      res.json({
+        booked: false,
+        fallback: true,
+        fallback_url: spec.fallback_url,
+        spoken: `I wasn't able to book that slot directly. I'll send you a calendar link by email instead.`,
+        spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
+        error: err.message,
+      });
+    }
+  });
+
+  /**
+   * GET /calendly/status
+   *
+   * Health/config check for Calendly integration.
+   */
+  app.get("/calendly/status", async (_req, res) => {
+    let eventTypes = null;
+    try {
+      if (CALENDLY_API_TOKEN) {
+        await resolveEventTypes();
+        eventTypes = Object.values(_eventTypeCache || {}).map((et) => ({
+          name: et.name,
+          slug: et.slug,
+          duration: et.duration,
+        }));
+      }
+    } catch (err) {
+      // Non-fatal — just report config status
+    }
+
+    res.json({
+      configured: !!CALENDLY_API_TOKEN,
+      specialists: Object.entries(SPECIALISTS).map(([key, val]) => ({
+        key,
+        name: val.name,
+        event_type_configured: !!val.event_type_uri,
+        fallback_url: val.fallback_url,
+      })),
+      discovered_event_types: eventTypes,
+    });
+  });
+}
+
+module.exports = {
+  registerRoutes,
+  getAvailability,
+  createBooking,
+  formatSlotsForVoice,
+  resolveEventTypes,
+  getDefaultSpecialist,
+  SPECIALISTS,
+};

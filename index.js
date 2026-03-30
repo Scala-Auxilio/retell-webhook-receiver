@@ -1,7 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { Pool } = require("pg");
-const tidycal = require("./tidycal");
+const calendly = require("./calendly");
 const scorer = require("./interaction-scorer");
 const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 
@@ -242,7 +242,7 @@ app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
-    version: "1.5.0",
+    version: "1.6.0",
     description: "Scala Auxilium — Retell AI webhook ingestion for Paperclip monitoring agents",
   });
 });
@@ -632,8 +632,8 @@ app.post("/webhooks/econowind", requireAuth, async (req, res) => {
   }
 });
 
-// ─── TidyCal Integration (live booking for Retell agents) ───────────────────
-tidycal.registerRoutes(app);
+// ─── Calendly Integration (live booking for Retell agents) ──────────────────
+calendly.registerRoutes(app);
 
 // ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
 scorer.registerRoutes(app, pool);
@@ -781,7 +781,7 @@ async function start() {
   try {
     await initDatabase();
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Retell Webhook Receiver v1.5.0 listening on port ${PORT}`);
+      console.log(`Retell Webhook Receiver v1.6.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);
       console.log(`   POST /webhooks/econowind  - EconoWind lead notification routing`);
       console.log(`   POST /notify              - Send email notification`);
@@ -794,9 +794,9 @@ async function start() {
       console.log(`   GET  /batch-call/agents   - Available batch call agents`);
       console.log(`   POST /zoho/aria-trigger   - Zoho Flow → Aria call pipeline`);
       console.log(`   POST /zoho/aria-result    - Call result callback for Zoho`);
-      console.log(`   GET  /tidycal/availability - TidyCal slot check (Retell custom fn)`);
-      console.log(`   POST /tidycal/book        - TidyCal booking create (Retell custom fn)`);
-      console.log(`   GET  /tidycal/status       - TidyCal integration health check`);
+      console.log(`   GET  /calendly/availability - Calendly slot check (Retell custom fn)`);
+      console.log(`   POST /calendly/book        - Calendly booking create (Retell custom fn)`);
+      console.log(`   GET  /calendly/status       - Calendly integration health check`);
       console.log(`   GET  /scorer/rubric       - Interaction scoring rubric`);
       console.log(`   GET  /scorer/unscored     - Unscored calls for Interaction Scorer`);
       console.log(`   POST /scorer/score        - Submit interaction score`);

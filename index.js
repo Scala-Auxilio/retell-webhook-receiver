@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const { Pool } = require("pg");
 const calendly = require("./calendly");
 const scorer = require("./interaction-scorer");
+const odooProxy = require("./odoo-proxy");
 const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -305,6 +306,28 @@ app.post("/webhooks/retell", async (req, res) => {
     );
 
     console.log(`  [OK] Stored in retell_events.`);
+
+    // ─── EconoWind auto-routing: detect VentoBot chats and trigger lead scoring ──
+    const ECONOWIND_AGENT_ID = "agent_760482429951f50e816c47b55a";
+    if (agentId === ECONOWIND_AGENT_ID && eventType === "call_ended" && callAnalysis) {
+      console.log(`  [EW] EconoWind chat ended — extracting lead data from post-chat analysis...`);
+      try {
+        const lead = mapRetellToEconowindLead(callAnalysis, transcript);
+        if (lead) {
+          await processEconowindLead(lead, receivedAt);
+        } else {
+          console.log(`  [EW] No actionable lead data extracted — skipping lead processing.`);
+        }
+      } catch (ewErr) {
+        console.error(`  [ERR] EconoWind auto-routing failed:`, ewErr.message);
+        // Don't throw — the main webhook already succeeded
+        await pool.query(
+          `INSERT INTO notifications (subject, body, priority, source, status, error)
+           VALUES ($1, $2, $3, 'econowind_ventobot_auto', 'failed', $4)`,
+          [`Auto-routing failed for chat ${callId}`, ewErr.message, "unknown", ewErr.message]
+        ).catch(() => {});
+      }
+    }
   } catch (err) {
     // DB write failed — we already returned 200 to Retell so it won't retry.
     // Log the error and the full payload so nothing is silently lost.
@@ -531,24 +554,171 @@ function buildLeadEmailHtml(lead, priorityInfo, manager) {
 </html>`;
 }
 
-// ─── EconoWind Lead Notification Endpoint ───────────────────────────────────
-app.post("/webhooks/econowind", requireAuth, async (req, res) => {
-  const receivedAt = new Date().toISOString();
-  const lead = req.body;
+// ─── EconoWind Lead Processing (shared logic) ───────────────────────────────
 
-  // Validate minimum required fields
-  if (!lead.company_name && !lead.contact_name) {
-    return res.status(400).json({ error: "Missing required fields: company_name or contact_name" });
+// Maps Retell post-chat extraction (call_analysis) to econowind lead format
+function mapRetellToEconowindLead(callAnalysis, transcript) {
+  if (!callAnalysis) return null;
+
+  // Retell post-chat extraction fields → econowind lead fields
+  const lead = {
+    company_name: callAnalysis.visitor_company || null,
+    contact_name: callAnalysis.visitor_name || null,
+    contact_email: callAnalysis.visitor_email || null,
+    contact_phone: null, // Chat widget doesn't capture phone
+    job_title: callAnalysis.visitor_role || null,
+    fleet_size: callAnalysis.fleet_size || null,
+    vessel_types: callAnalysis.vessel_types || null,
+    region: callAnalysis.route_profile || null, // route_profile maps to sailing region
+    timeline: callAnalysis.timeline_drydock || null,
+    decision_authority: null, // Inferred from role if available
+    awareness_level: callAnalysis.primary_motivation || null,
+    specific_interest: callAnalysis.topics_discussed || null,
+    conversation_summary: callAnalysis.qualification_summary || callAnalysis.chat_summary || null,
+    // Scoring: use extracted scores if available, otherwise estimate from data
+    revenue_score: parseInt(callAnalysis.revenue_score) || estimateRevenueScore(callAnalysis),
+    conversion_score: parseInt(callAnalysis.conversion_score) || estimateConversionScore(callAnalysis),
+  };
+
+  // Skip if no meaningful data extracted
+  if (!lead.company_name && !lead.contact_name && !lead.contact_email) {
+    return null;
   }
 
-  // Classify priority
+  return lead;
+}
+
+// Estimate revenue score (0-25) from extracted chat data when explicit score not available
+function estimateRevenueScore(data) {
+  let score = 0;
+  // Fleet size scoring (0-10)
+  const fleet = (data.fleet_size || "").toLowerCase();
+  if (fleet.includes("50") || fleet.includes("100") || fleet.includes("large")) score += 10;
+  else if (fleet.includes("20") || fleet.includes("30") || fleet.includes("medium")) score += 7;
+  else if (fleet.includes("10") || fleet.includes("15")) score += 5;
+  else if (fleet.includes("5") || fleet.includes("small")) score += 3;
+  else if (fleet) score += 2;
+
+  // Vessel type fit (0-8)
+  const fit = (data.vessel_type_fit || "").toLowerCase();
+  if (fit.includes("excellent") || fit.includes("ideal") || fit.includes("perfect")) score += 8;
+  else if (fit.includes("good") || fit.includes("suitable")) score += 6;
+  else if (fit.includes("moderate") || fit.includes("possible")) score += 4;
+  else if (fit) score += 2;
+
+  // Vessel size DWT (0-7)
+  const dwt = parseInt(data.vessel_size_dwt) || 0;
+  if (dwt >= 40000) score += 7;
+  else if (dwt >= 20000) score += 5;
+  else if (dwt >= 5000) score += 3;
+  else if (dwt > 0) score += 1;
+
+  return Math.min(score, 25);
+}
+
+// Estimate conversion score (0-18) from extracted chat data when explicit score not available
+function estimateConversionScore(data) {
+  let score = 0;
+  // CII pressure / regulatory urgency (0-5)
+  const cii = (data.cii_pressure || "").toLowerCase();
+  if (cii.includes("high") || cii.includes("urgent") || cii.includes("critical")) score += 5;
+  else if (cii.includes("medium") || cii.includes("moderate")) score += 3;
+  else if (cii) score += 1;
+
+  // Timeline (0-5)
+  const timeline = (data.timeline_drydock || "").toLowerCase();
+  if (timeline.includes("immediate") || timeline.includes("now") || timeline.includes("month")) score += 5;
+  else if (timeline.includes("quarter") || timeline.includes("6 month") || timeline.includes("soon")) score += 4;
+  else if (timeline.includes("year") || timeline.includes("2026") || timeline.includes("2027")) score += 2;
+  else if (timeline) score += 1;
+
+  // Meeting requested (0-4)
+  const meeting = (data.meeting_requested || "").toLowerCase();
+  if (meeting === "true" || meeting === "yes" || meeting.includes("yes")) score += 4;
+  else if (meeting.includes("maybe") || meeting.includes("interested")) score += 2;
+
+  // Chat successful (0-4)
+  const successful = (data.chat_successful || data.Chat_Successful || "").toLowerCase();
+  if (successful === "true" || successful === "yes" || successful.includes("yes")) score += 4;
+  else if (successful.includes("partial")) score += 2;
+
+  return Math.min(score, 18);
+}
+
+// Core lead processing: scoring, routing, DB storage, email notification
+async function processEconowindLead(lead, receivedAt) {
   const priorityInfo = classifyPriority(lead.revenue_score, lead.conversion_score);
   const manager = routeToManager(lead.region);
   const totalScore = (parseInt(lead.revenue_score) || 0) + (parseInt(lead.conversion_score) || 0);
 
-  console.log(`→ [${receivedAt}] EconoWind lead: ${lead.company_name} | ${priorityInfo.priority} (${priorityInfo.label}) | → ${manager.name} (${manager.email})`);
+  console.log(`  [EW] Lead: ${lead.company_name || lead.contact_name} | ${priorityInfo.priority} (${priorityInfo.label}) | → ${manager.name} (${manager.email})`);
 
-  // Return immediately with routing result
+  // Store lead in database
+  await pool.query(
+    `INSERT INTO econowind_leads
+      (company_name, contact_name, contact_email, contact_phone, job_title,
+       fleet_size, vessel_types, region, timeline, decision_authority,
+       awareness_level, specific_interest, conversation_summary,
+       revenue_score, conversion_score, total_score, priority,
+       assigned_manager, manager_email, received_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+    [
+      lead.company_name, lead.contact_name, lead.contact_email, lead.contact_phone, lead.job_title,
+      lead.fleet_size, lead.vessel_types, lead.region, lead.timeline, lead.decision_authority,
+      lead.awareness_level, lead.specific_interest, lead.conversation_summary,
+      parseInt(lead.revenue_score) || 0, parseInt(lead.conversion_score) || 0, totalScore,
+      priorityInfo.priority, manager.name, manager.email, receivedAt,
+    ]
+  );
+  console.log(`  [OK] Lead stored in econowind_leads.`);
+
+  // Send email notification for P1, P2, P3 (skip P4)
+  if (priorityInfo.priority === "P4") {
+    console.log(`  [SKIP] P4 lead — no sales notification. Logged for monthly marketing review.`);
+    return { priorityInfo, manager, notification: "skipped_p4" };
+  }
+
+  if (!RESEND_API_KEY) {
+    console.warn(`  [WARN] Email not configured — cannot send ${priorityInfo.priority} notification.`);
+    return { priorityInfo, manager, notification: "email_not_configured" };
+  }
+
+  const subject = `[${priorityInfo.priority} - ${priorityInfo.label}] New EconoWind Lead: ${lead.company_name || lead.contact_name}`;
+  const html = buildLeadEmailHtml(lead, priorityInfo, manager);
+  const textBody = `${priorityInfo.priority} - ${priorityInfo.label}\n\nNew EconoWind Lead: ${lead.company_name}\nContact: ${lead.contact_name} (${lead.contact_email})\nRegion: ${lead.region}\nScores: Revenue ${lead.revenue_score}/25, Conversion ${lead.conversion_score}/18\nSLA: ${priorityInfo.sla}\nAssigned to: ${manager.name}`;
+
+  const recipients = [manager.email];
+  if (priorityInfo.priority === "P1" && ECONOWIND_CC_P1) {
+    recipients.push(ECONOWIND_CC_P1);
+  }
+
+  await sendEmail({ from: NOTIFY_FROM, to: recipients, subject, text: textBody, html });
+
+  await pool.query(
+    `UPDATE econowind_leads SET notification_sent = TRUE WHERE company_name = $1 AND received_at = $2`,
+    [lead.company_name, receivedAt]
+  );
+  await pool.query(
+    `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, $3, 'econowind_ventobot', 'sent')`,
+    [subject, textBody, priorityInfo.priority]
+  );
+
+  console.log(`  [OK] ${priorityInfo.priority} notification sent to ${recipients.join(", ")}`);
+  return { priorityInfo, manager, notification: "sent" };
+}
+
+// ─── EconoWind Lead Notification Endpoint (direct API) ──────────────────────
+app.post("/webhooks/econowind", requireAuth, async (req, res) => {
+  const receivedAt = new Date().toISOString();
+  const lead = req.body;
+
+  if (!lead.company_name && !lead.contact_name) {
+    return res.status(400).json({ error: "Missing required fields: company_name or contact_name" });
+  }
+
+  const priorityInfo = classifyPriority(lead.revenue_score, lead.conversion_score);
+  const manager = routeToManager(lead.region);
+
   res.json({
     received: true,
     priority: priorityInfo.priority,
@@ -560,70 +730,9 @@ app.post("/webhooks/econowind", requireAuth, async (req, res) => {
   });
 
   try {
-    // Store lead in database
-    await pool.query(
-      `INSERT INTO econowind_leads
-        (company_name, contact_name, contact_email, contact_phone, job_title,
-         fleet_size, vessel_types, region, timeline, decision_authority,
-         awareness_level, specific_interest, conversation_summary,
-         revenue_score, conversion_score, total_score, priority,
-         assigned_manager, manager_email, received_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
-      [
-        lead.company_name, lead.contact_name, lead.contact_email, lead.contact_phone, lead.job_title,
-        lead.fleet_size, lead.vessel_types, lead.region, lead.timeline, lead.decision_authority,
-        lead.awareness_level, lead.specific_interest, lead.conversation_summary,
-        parseInt(lead.revenue_score) || 0, parseInt(lead.conversion_score) || 0, totalScore,
-        priorityInfo.priority, manager.name, manager.email, receivedAt,
-      ]
-    );
-    console.log(`  [OK] Lead stored in econowind_leads.`);
-
-    // Send email notification for P1, P2, P3 (skip P4)
-    if (priorityInfo.priority === "P4") {
-      console.log(`  [SKIP] P4 lead — no sales notification. Logged for monthly marketing review.`);
-      return;
-    }
-
-    if (!RESEND_API_KEY) {
-      console.warn(`  [WARN] Email not configured — cannot send ${priorityInfo.priority} notification.`);
-      return;
-    }
-
-    const subject = `[${priorityInfo.priority} - ${priorityInfo.label}] New EconoWind Lead: ${lead.company_name || lead.contact_name}`;
-    const html = buildLeadEmailHtml(lead, priorityInfo, manager);
-    const textBody = `${priorityInfo.priority} - ${priorityInfo.label}\n\nNew EconoWind Lead: ${lead.company_name}\nContact: ${lead.contact_name} (${lead.contact_email})\nRegion: ${lead.region}\nScores: Revenue ${lead.revenue_score}/25, Conversion ${lead.conversion_score}/18\nSLA: ${priorityInfo.sla}\nAssigned to: ${manager.name}`;
-
-    // Build recipient list: sales manager + CC Piet on P1
-    const recipients = [manager.email];
-    if (priorityInfo.priority === "P1" && ECONOWIND_CC_P1) {
-      recipients.push(ECONOWIND_CC_P1);
-    }
-
-    await sendEmail({
-      from: NOTIFY_FROM,
-      to: recipients,
-      subject,
-      text: textBody,
-      html,
-    });
-
-    // Update lead as notified
-    await pool.query(
-      `UPDATE econowind_leads SET notification_sent = TRUE WHERE company_name = $1 AND received_at = $2`,
-      [lead.company_name, receivedAt]
-    );
-
-    // Log notification
-    await pool.query(
-      `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, $3, 'econowind_ventobot', 'sent')`,
-      [subject, textBody, priorityInfo.priority]
-    );
-
-    console.log(`  [OK] ${priorityInfo.priority} notification sent to ${recipients.join(", ")}`);
+    await processEconowindLead(lead, receivedAt);
   } catch (err) {
     console.error(`  [ERR] EconoWind lead processing failed:`, err.message);
-    // Log failure
     await pool.query(
       `INSERT INTO notifications (subject, body, priority, source, status, error)
        VALUES ($1, $2, $3, 'econowind_ventobot', 'failed', $4)`,
@@ -637,6 +746,9 @@ calendly.registerRoutes(app);
 
 // ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
 scorer.registerRoutes(app, pool);
+
+// ─── Odoo CRM Proxy (pipeline monitoring for Paperclip agents) ──────────────
+odooProxy.registerRoutes(app, pool);
 
 // ─── Zoho CRM → Aria Pipeline Endpoint ──────────────────────────────────────
 

@@ -17,6 +17,9 @@ const NOTIFY_FROM = process.env.NOTIFY_FROM || "notifications@adsum-auxilio.com"
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 
+// ─── Zoho Flow Webhook (Aria End Call) ───────────────────────────────────────
+const ZOHO_FLOW_ARIA_END_CALL_URL = process.env.ZOHO_FLOW_ARIA_END_CALL_URL || null;
+
 // ─── EconoWind Lead Routing Config ──────────────────────────────────────────
 const ECONOWIND_MANAGERS = {
   "southern_europe": { name: "Willem Stam", email: "stam@econowind.nl", region: "Southern Europe & Turkey" },
@@ -243,7 +246,7 @@ app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
-    version: "1.6.0",
+    version: "1.7.0",
     description: "Scala Auxilium — Retell AI webhook ingestion for Paperclip monitoring agents",
   });
 });
@@ -258,6 +261,92 @@ app.get("/health", async (_req, res) => {
 });
 
 // ─── Main webhook endpoint ────────────────────────────────────────────────────
+// ─── Aria Call-Ended → Zoho Flow Disposition Mapping ─────────────────────────
+
+function mapAriaDisposition(callData, callAnalysis) {
+  if (callAnalysis) {
+    const outcome = (callAnalysis.call_outcome || callAnalysis.outcome || "").toLowerCase().trim();
+    const valid = ["no_answer","voicemail_left","meeting_booked","callback_requested","not_interested","wrong_person","referral_given","call_failed"];
+    if (valid.includes(outcome)) return { disposition: outcome, method: "call_analysis", confidence: "high" };
+    if (/meeting|booked|demo|scheduled|appointment/i.test(outcome)) return { disposition: "meeting_booked", method: "call_analysis_fuzzy", confidence: "high" };
+    if (/not.interested|declined|rejected|no.thanks/i.test(outcome)) return { disposition: "not_interested", method: "call_analysis_fuzzy", confidence: "high" };
+    if (/callback|call.back|reschedule|later/i.test(outcome)) return { disposition: "callback_requested", method: "call_analysis_fuzzy", confidence: "medium" };
+    if (/voicemail|vm|left.message/i.test(outcome)) return { disposition: "voicemail_left", method: "call_analysis_fuzzy", confidence: "high" };
+    if (/wrong.person|wrong.number|not.the.right/i.test(outcome)) return { disposition: "wrong_person", method: "call_analysis_fuzzy", confidence: "high" };
+    if (/referr|redirect|colleague|pass/i.test(outcome)) return { disposition: "referral_given", method: "call_analysis_fuzzy", confidence: "medium" };
+    if (/no.answer|no.pickup|unanswered/i.test(outcome)) return { disposition: "no_answer", method: "call_analysis_fuzzy", confidence: "high" };
+    if (/fail|error|technical/i.test(outcome)) return { disposition: "call_failed", method: "call_analysis_fuzzy", confidence: "high" };
+  }
+  const reason = (callData.disconnection_reason || "").toLowerCase();
+  const durationMs = callData.duration_ms || 0;
+  const hasTranscript = !!(callData.transcript && callData.transcript.length > 50);
+  if (reason === "dial_no_answer" || reason === "no_answer") return { disposition: "no_answer", method: "disconnection_reason", confidence: "high" };
+  if (reason === "dial_busy") return { disposition: "no_answer", method: "disconnection_reason", confidence: "high" };
+  if (reason === "machine_detected" || reason === "voicemail_reach") return { disposition: "voicemail_left", method: "disconnection_reason", confidence: "medium" };
+  if (reason === "dial_failed" || reason === "line_busy") return { disposition: "call_failed", method: "disconnection_reason", confidence: "high" };
+  if (reason.startsWith("error_") || reason === "unknown_error") return { disposition: "call_failed", method: "disconnection_reason", confidence: "high" };
+  if (reason === "user_hangup" || reason === "agent_hangup" || reason === "inactivity") {
+    if (durationMs < 15000 && !hasTranscript) return { disposition: "no_answer", method: "short_call_heuristic", confidence: "low" };
+    return { disposition: "call_failed", method: "no_analysis_fallback", confidence: "low" };
+  }
+  return { disposition: "call_failed", method: "unknown", confidence: "low" };
+}
+
+async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
+  const dynVars = callData.retell_llm_dynamic_variables || {};
+  const zohoLeadId = dynVars.zoho_lead_id || null;
+  const prospectName = dynVars.prospect_first_name || dynVars.contact_name || "";
+  const universityName = dynVars.university_name || "";
+
+  console.log(`  [ARIA] Call ended for ${agentLabel} | lead: ${zohoLeadId || "(unknown)"} | prospect: ${prospectName}`);
+
+  if (!zohoLeadId) {
+    console.warn(`  [ARIA] No zoho_lead_id — cannot update Zoho CRM. Call: ${callId}`);
+    await pool.query(
+      `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, 'high', 'aria_call_ended', 'skipped')`,
+      [`Aria call missing zoho_lead_id: ${prospectName || callId}`, JSON.stringify({ call_id: callId, agent: agentLabel, dynamic_vars: dynVars })]
+    );
+    return;
+  }
+
+  const { disposition, method, confidence } = mapAriaDisposition(callData, callAnalysis);
+  const durationSec = Math.round((callData.duration_ms || 0) / 1000);
+  const disconnectReason = callData.disconnection_reason || "unknown";
+  const analysisSummary = callAnalysis?.call_summary || callAnalysis?.summary || "";
+  const notes = [analysisSummary, `Duration: ${durationSec}s`, `Disconnect: ${disconnectReason}`, `Disposition method: ${method} (${confidence})`].filter(Boolean).join(". ");
+  const prospectEmail = callAnalysis?.prospect_email || callAnalysis?.email || dynVars.prospect_email || "";
+
+  console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | lead: ${zohoLeadId}`);
+
+  if (!ZOHO_FLOW_ARIA_END_CALL_URL) {
+    console.error(`  [ARIA] ZOHO_FLOW_ARIA_END_CALL_URL not configured — skipping Zoho Flow POST`);
+    return;
+  }
+
+  const zohoPayload = {
+    lead_id: zohoLeadId, disposition, notes, prospect_email: prospectEmail,
+    call_id: callId, agent: agentLabel, confidence, method, duration_sec: durationSec,
+    prospect_name: prospectName, university_name: universityName,
+  };
+
+  const response = await fetch(ZOHO_FLOW_ARIA_END_CALL_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(zohoPayload),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "(no body)");
+    throw new Error(`Zoho Flow webhook returned ${response.status}: ${errText}`);
+  }
+
+  console.log(`  [ARIA] Zoho Flow webhook accepted (${response.status}) for lead ${zohoLeadId}`);
+  await pool.query(
+    `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, 'normal', 'aria_call_ended', 'sent')`,
+    [`Aria ${disposition}: ${prospectName} @ ${universityName}`, JSON.stringify(zohoPayload)]
+  );
+}
+
 app.post("/webhooks/retell", async (req, res) => {
   const receivedAt = new Date().toISOString();
 
@@ -325,6 +414,24 @@ app.post("/webhooks/retell", async (req, res) => {
           `INSERT INTO notifications (subject, body, priority, source, status, error)
            VALUES ($1, $2, $3, 'econowind_ventobot_auto', 'failed', $4)`,
           [`Auto-routing failed for chat ${callId}`, ewErr.message, "unknown", ewErr.message]
+        ).catch(() => {});
+      }
+    }
+
+    // ─── Aria (Sendsteps) call-end → forward result to Zoho Flow ────────────
+    const ARIA_AGENT_IDS = [
+      "agent_aa56b68b02f6de4ac5725a829b", // Aria EN
+      "agent_e1e1f763101db5abe0df281891", // Aria NL
+    ];
+    if (ARIA_AGENT_IDS.includes(agentId) && eventType === "call_ended") {
+      try {
+        await handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt);
+      } catch (ariaErr) {
+        console.error(`  [ARIA] Zoho Flow update failed:`, ariaErr.message);
+        await pool.query(
+          `INSERT INTO notifications (subject, body, priority, source, status, error)
+           VALUES ($1, $2, $3, 'aria_call_ended', 'failed', $4)`,
+          [`Aria Zoho update failed for call ${callId}`, ariaErr.message, "high", ariaErr.message]
         ).catch(() => {});
       }
     }
@@ -844,10 +951,10 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   }
 });
 
-// ─── Zoho CRM Status Callback (update lead after call completes) ────────────
+// ─── Zoho CRM Status Callback (legacy — kept for backward compat) ────────────
 app.post("/zoho/aria-result", requireAuth, async (req, res) => {
-  // This endpoint receives call results and can be used to update Zoho CRM via API
-  // For now, it logs the result. Phase 2 (May) will use Zoho CRM API to update the lead.
+  // NOTE: Aria call results are now handled automatically in /webhooks/retell
+  // (see handleAriaCallEnded). This endpoint is kept for any direct API callers.
 
   const { zoho_lead_id, call_id, status, transcript_summary } = req.body;
   console.log(`→ [ZOHO] Aria result: lead=${zoho_lead_id} call=${call_id} status=${status}`);
@@ -893,7 +1000,7 @@ async function start() {
   try {
     await initDatabase();
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Retell Webhook Receiver v1.6.0 listening on port ${PORT}`);
+      console.log(`Retell Webhook Receiver v1.7.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);
       console.log(`   POST /webhooks/econowind  - EconoWind lead notification routing`);
       console.log(`   POST /notify              - Send email notification`);

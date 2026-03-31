@@ -246,7 +246,7 @@ app.get("/", (_req, res) => {
   res.json({
     service: "retell-webhook-receiver",
     status: "ok",
-    version: "1.7.0",
+    version: "1.8.0",
     description: "Scala Auxilium — Retell AI webhook ingestion for Paperclip monitoring agents",
   });
 });

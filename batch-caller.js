@@ -1,5 +1,5 @@
 /**
- * Scala Auxilium â Retell Batch Call Dispatcher
+ * Scala Auxilium — Retell Batch Call Dispatcher
  *
  * Reads a prospect list (JSON) and dispatches batch calls via Retell API.
  * Designed to be called from a simple upload endpoint or run standalone.
@@ -16,11 +16,11 @@
 const fs = require("fs");
 const path = require("path");
 
-// âââ Config âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── Config ─────────────────────────────────────────────────────────────────
 const RETELL_API_KEY = process.env.RETELL_API_KEY || null;
 const RETELL_API_BASE = "https://api.retellai.com";
 
-// Agent configs â maps friendly names to Retell agent IDs and phone numbers
+// Agent configs — maps friendly names to Retell agent IDs and phone numbers
 const AGENTS = {
   aria_en: {
     agent_id: "agent_aa56b68b02f6de4ac5725a829b",
@@ -34,11 +34,11 @@ const AGENTS = {
   },
 };
 
-// CET calling window: MonâFri 09:00â17:00
+// CET calling window: Mon–Fri 09:00–17:00
 const CALLING_WINDOW = {
   timezone: "Europe/Amsterdam",
   windows: [
-    { day: 1, start_min: 540, end_min: 1020 }, // Mon 09:00â17:00
+    { day: 1, start_min: 540, end_min: 1020 }, // Mon 09:00–17:00
     { day: 2, start_min: 540, end_min: 1020 }, // Tue
     { day: 3, start_min: 540, end_min: 1020 }, // Wed
     { day: 4, start_min: 540, end_min: 1020 }, // Thu
@@ -46,7 +46,44 @@ const CALLING_WINDOW = {
   ],
 };
 
-// âââ Zoho CRM Lead â Prospect mapping âââââââââââââââââââââââââââââââââââââââ
+// ─── Lead Owner → Calendly Specialist mapping ────────────────────────────────
+// Maps Zoho CRM Lead Owner to Calendly specialist key.
+// Owner field from Zoho is a JSON object: { name, id, email }
+// Known owners:
+//   Rogier Smulders       (rogier.smulders@sendsteps.com) → "rogier"
+//   Mike Coumans l Sendsteps (mike.coumans@sendsteps.com) → "mike"
+const OWNER_TO_SPECIALIST = {
+  // Match by Zoho user ID (most reliable, never changes)
+  "437076000003563557": "rogier",   // Rogier Smulders
+  "437076000003563509": "mike",     // Mike Coumans
+  // Match by email (fallback)
+  "rogier.smulders@sendsteps.com": "rogier",
+  "mike.coumans@sendsteps.com": "mike",
+};
+
+function mapOwnerToSpecialist(ownerObj) {
+  if (!ownerObj) return null;
+
+  // Try by Zoho user ID first (most reliable)
+  const byId = OWNER_TO_SPECIALIST[String(ownerObj.id)];
+  if (byId) return byId;
+
+  // Try by email
+  const email = (ownerObj.email || "").toLowerCase();
+  const byEmail = OWNER_TO_SPECIALIST[email];
+  if (byEmail) return byEmail;
+
+  // Try by name (partial match on first name)
+  const name = (ownerObj.name || "").toLowerCase();
+  if (name.includes("rogier")) return "rogier";
+  if (name.includes("mike")) return "mike";
+
+  // Unknown owner — log warning, return null (caller decides fallback)
+  console.warn(`[OWNER] Unknown lead owner: ${JSON.stringify(ownerObj)} — cannot map to specialist`);
+  return null;
+}
+
+// ─── Zoho CRM Lead → Prospect mapping ───────────────────────────────────────
 // Zoho Flow sends lead data in Zoho CRM field names. This maps to our format.
 function mapZohoLead(zohoLead) {
   const firstName = zohoLead.First_Name || zohoLead.first_name || "";
@@ -54,15 +91,19 @@ function mapZohoLead(zohoLead) {
   const eduLevel = zohoLead.Edu_level || zohoLead.edu_level || "";
   const jobTitle = zohoLead.Job_Title_Edu || zohoLead.Job_Title_Business || zohoLead.job_title_edu || "";
 
+  // Extract lead owner and map to Calendly specialist
+  const ownerObj = zohoLead.Owner || zohoLead.owner || null;
+  const specialist = mapOwnerToSpecialist(ownerObj);
+
   return {
     phone_number: zohoLead.Phone || zohoLead.phone || "",
     university_name: zohoLead.Educational_Institute || zohoLead.Educational_institute || zohoLead.Company || zohoLead.company || "",
-    // Retell agent uses {{prospect_first_name}} â keep first/last split
+    // Retell agent uses {{prospect_first_name}} — keep first/last split
     first_name: firstName,
     last_name: lastName,
     contact_name: [firstName, lastName].filter(Boolean).join(" "),
     contact_title: jobTitle,
-    // Retell agent uses {{persona_type}} â derive from edu_level or job title
+    // Retell agent uses {{persona_type}} — derive from edu_level or job title
     persona_type: derivePersonaType(eduLevel, jobTitle),
     department: zohoLead.Segment || zohoLead.segment || "",
     country: zohoLead.Country || zohoLead.country || "",
@@ -74,6 +115,9 @@ function mapZohoLead(zohoLead) {
     edu_level: eduLevel,
     type_of_plan: zohoLead.Type_of_Plan || zohoLead.type_of_plan || "",
     language: zohoLead.Language || zohoLead.language || "",
+    // Calendly specialist routing (derived from Lead Owner)
+    specialist: specialist,
+    lead_owner_name: ownerObj ? (ownerObj.name || "") : "",
   };
 }
 
@@ -104,7 +148,7 @@ function agentFromAriaStatus(ariaStatus) {
   return null;
 }
 
-// âââ Validation âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── Validation ─────────────────────────────────────────────────────────────
 
 function validateE164(phone) {
   return /^\+[1-9]\d{6,14}$/.test(phone);
@@ -113,12 +157,12 @@ function validateE164(phone) {
 function validateProspect(prospect, index) {
   const errors = [];
   if (!prospect.phone_number) errors.push(`Row ${index}: missing phone_number`);
-  else if (!validateE164(prospect.phone_number)) errors.push(`Row ${index}: invalid E.164 format '${prospect.phone_number}' â must be +[country][number]`);
+  else if (!validateE164(prospect.phone_number)) errors.push(`Row ${index}: invalid E.164 format '${prospect.phone_number}' — must be +[country][number]`);
   if (!prospect.university_name && !prospect.contact_name) errors.push(`Row ${index}: need at least university_name or contact_name`);
   return errors;
 }
 
-// âââ Build Retell batch call payload ââââââââââââââââââââââââââââââââââââââââ
+// ─── Build Retell batch call payload ────────────────────────────────────────
 
 function buildBatchPayload(prospects, agentKey, options = {}) {
   const agent = AGENTS[agentKey];
@@ -135,11 +179,14 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
   const tasks = prospects.map((p) => ({
     to_number: p.phone_number,
     retell_llm_dynamic_variables: {
-      // ââ Variables used by Retell agent flow nodes ââ
+      // ── Variables used by Retell agent flow nodes ──
       prospect_first_name: getFirstName(p),           // Confirm Contact, Opener, Closing
       university_name: p.university_name || "",        // Confirm Contact, Book Meeting CTA
       persona_type: p.persona_type || "faculty",       // Opener, Qualify, Value Pitch
-      // ââ Extra context (available to global prompt / knowledge base) ââ
+      // ── Calendly specialist routing (derived from Lead Owner) ──
+      specialist: p.specialist || "",                  // Used by Retell agent when calling /calendly/availability
+      lead_owner_name: p.lead_owner_name || "",        // For agent context (e.g. "You'll be meeting with Rogier")
+      // ── Extra context (available to global prompt / knowledge base) ──
       contact_name: p.contact_name || "",
       contact_title: p.contact_title || "",
       department: p.department || "",
@@ -154,7 +201,7 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
     agent_id: agent.agent_id,
     from_number: agent.from_number,
     tasks,
-    name: options.name || `Sendsteps ${agentKey.toUpperCase()} batch â ${new Date().toISOString().split("T")[0]}`,
+    name: options.name || `Sendsteps ${agentKey.toUpperCase()} batch — ${new Date().toISOString().split("T")[0]}`,
   };
 
   // Add calling window
@@ -177,7 +224,7 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
   return payload;
 }
 
-// âââ API call âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── API call ───────────────────────────────────────────────────────────────
 
 async function createBatchCall(prospects, options = {}) {
   const agentKey = options.agent || "aria_en";
@@ -233,7 +280,7 @@ async function createBatchCall(prospects, options = {}) {
   };
 }
 
-// âââ Parse prospect list from JSON file âââââââââââââââââââââââââââââââââââââ
+// ─── Parse prospect list from JSON file ─────────────────────────────────────
 
 function parseProspectList(filePath) {
   const raw = fs.readFileSync(filePath, "utf-8");
@@ -242,7 +289,7 @@ function parseProspectList(filePath) {
   return Array.isArray(data) ? data : data.prospects || data.tasks || [];
 }
 
-// âââ CLI ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── CLI ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const args = process.argv.slice(2);
@@ -293,4 +340,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { createBatchCall, parseProspectList, buildBatchPayload, validateProspect, mapZohoLead, agentFromAriaStatus, derivePersonaType, AGENTS, CALLING_WINDOW };
+module.exports = { createBatchCall, parseProspectList, buildBatchPayload, validateProspect, mapZohoLead, mapOwnerToSpecialist, agentFromAriaStatus, derivePersonaType, AGENTS, CALLING_WINDOW, OWNER_TO_SPECIALIST };

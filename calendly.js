@@ -117,9 +117,11 @@ async function resolveEventTypes() {
 // ─── Default specialist routing ──────────────────────────────────────────────
 
 function getDefaultSpecialist() {
-  // Both Rogier and Mike handle EN and NL — round-robin or pick whoever has
-  // availability sooner. For now, default to Rogier.
-  return "rogier";
+  // No hardcoded default — specialist must be provided via Retell dynamic variable
+  // (derived from Zoho Lead Owner in batch-caller.js → mapOwnerToSpecialist).
+  // If neither Retell nor the caller provides a specialist, return null so the
+  // endpoint can return a clear error instead of silently routing to the wrong person.
+  return null;
 }
 
 // ─── Availability Check ──────────────────────────────────────────────────────
@@ -305,6 +307,19 @@ function registerRoutes(app) {
       await resolveEventTypes();
 
       const specKey = specialist || getDefaultSpecialist();
+
+      if (!specKey) {
+        // No specialist provided and no default — cannot route to a calendar
+        console.error(`[CALENDLY] No specialist provided. Query: ${JSON.stringify(req.query)}`);
+        return res.status(400).json({
+          error: "Missing 'specialist' parameter. Must be one of: " + Object.keys(SPECIALISTS).join(", "),
+          available: false,
+          fallback: true,
+          spoken: `I'll send you a calendar link by email so you can pick a time that suits you best.`,
+          spoken_nl: `Ik stuur u een agenda-link per e-mail zodat u zelf het beste moment kunt kiezen.`,
+        });
+      }
+
       const spec = SPECIALISTS[specKey];
 
       if (!spec) {
@@ -338,7 +353,7 @@ function registerRoutes(app) {
     } catch (err) {
       console.error("[CALENDLY] Availability check failed:", err.message);
       // On error, fall back to email-based booking
-      const specKey = req.query.specialist || getDefaultSpecialist();
+      const specKey = req.query.specialist || getDefaultSpecialist() || "rogier";
       const spec = SPECIALISTS[specKey] || SPECIALISTS.rogier;
       res.json({
         available: false,
@@ -381,6 +396,17 @@ function registerRoutes(app) {
       await resolveEventTypes();
 
       const specKey = specialist || getDefaultSpecialist();
+
+      if (!specKey) {
+        console.error(`[CALENDLY] No specialist provided for booking. Body: ${JSON.stringify({ specialist, name, email })}`);
+        return res.status(400).json({
+          error: "Missing 'specialist' parameter. Must be one of: " + Object.keys(SPECIALISTS).join(", "),
+          booked: false,
+          spoken: `I wasn't able to book that slot directly. I'll send you a calendar link by email instead.`,
+          spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
+        });
+      }
+
       const spec = SPECIALISTS[specKey];
 
       if (!spec || !spec.event_type_uri) {
@@ -423,7 +449,7 @@ function registerRoutes(app) {
       });
     } catch (err) {
       console.error("[CALENDLY] Booking failed:", err.message);
-      const specKey = req.body.specialist || getDefaultSpecialist();
+      const specKey = req.body.specialist || getDefaultSpecialist() || "rogier";
       const spec = SPECIALISTS[specKey] || SPECIALISTS.rogier;
       res.json({
         booked: false,

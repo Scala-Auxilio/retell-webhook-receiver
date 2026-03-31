@@ -260,38 +260,97 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// ─── Main webhook endpoint ────────────────────────────────────────────────────
 // ─── Aria Call-Ended → Zoho Flow Disposition Mapping ─────────────────────────
 
+/**
+ * Map a Retell call_ended event to one of our 8 Zoho CRM dispositions.
+ *
+ * Priority order:
+ *   1. call_analysis.call_outcome  (Retell Post-Call Analysis — most reliable)
+ *   2. disconnection_reason        (Retell call metadata — fallback)
+ *
+ * Dispositions: no_answer, voicemail_left, meeting_booked, callback_requested,
+ *               not_interested, wrong_person, referral_given, call_failed
+ */
 function mapAriaDisposition(callData, callAnalysis) {
+  // ── Method 1: Post-Call Analysis (if enabled on the Retell agent) ──────────
   if (callAnalysis) {
     const outcome = (callAnalysis.call_outcome || callAnalysis.outcome || "").toLowerCase().trim();
-    const valid = ["no_answer","voicemail_left","meeting_booked","callback_requested","not_interested","wrong_person","referral_given","call_failed"];
-    if (valid.includes(outcome)) return { disposition: outcome, method: "call_analysis", confidence: "high" };
-    if (/meeting|booked|demo|scheduled|appointment/i.test(outcome)) return { disposition: "meeting_booked", method: "call_analysis_fuzzy", confidence: "high" };
-    if (/not.interested|declined|rejected|no.thanks/i.test(outcome)) return { disposition: "not_interested", method: "call_analysis_fuzzy", confidence: "high" };
-    if (/callback|call.back|reschedule|later/i.test(outcome)) return { disposition: "callback_requested", method: "call_analysis_fuzzy", confidence: "medium" };
-    if (/voicemail|vm|left.message/i.test(outcome)) return { disposition: "voicemail_left", method: "call_analysis_fuzzy", confidence: "high" };
-    if (/wrong.person|wrong.number|not.the.right/i.test(outcome)) return { disposition: "wrong_person", method: "call_analysis_fuzzy", confidence: "high" };
-    if (/referr|redirect|colleague|pass/i.test(outcome)) return { disposition: "referral_given", method: "call_analysis_fuzzy", confidence: "medium" };
-    if (/no.answer|no.pickup|unanswered/i.test(outcome)) return { disposition: "no_answer", method: "call_analysis_fuzzy", confidence: "high" };
-    if (/fail|error|technical/i.test(outcome)) return { disposition: "call_failed", method: "call_analysis_fuzzy", confidence: "high" };
+    // Direct match against our 8 dispositions
+    const validDispositions = [
+      "no_answer", "voicemail_left", "meeting_booked", "callback_requested",
+      "not_interested", "wrong_person", "referral_given", "call_failed",
+    ];
+    if (validDispositions.includes(outcome)) {
+      return { disposition: outcome, method: "call_analysis", confidence: "high" };
+    }
+    // Fuzzy match common Retell analysis values
+    if (/meeting|booked|demo|scheduled|appointment/i.test(outcome)) {
+      return { disposition: "meeting_booked", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    if (/not.interested|declined|rejected|no.thanks/i.test(outcome)) {
+      return { disposition: "not_interested", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    if (/callback|call.back|reschedule|later/i.test(outcome)) {
+      return { disposition: "callback_requested", method: "call_analysis_fuzzy", confidence: "medium" };
+    }
+    if (/voicemail|vm|left.message/i.test(outcome)) {
+      return { disposition: "voicemail_left", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    if (/wrong.person|wrong.number|not.the.right/i.test(outcome)) {
+      return { disposition: "wrong_person", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    if (/referr|redirect|colleague|pass/i.test(outcome)) {
+      return { disposition: "referral_given", method: "call_analysis_fuzzy", confidence: "medium" };
+    }
+    if (/no.answer|no.pickup|unanswered/i.test(outcome)) {
+      return { disposition: "no_answer", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    if (/fail|error|technical/i.test(outcome)) {
+      return { disposition: "call_failed", method: "call_analysis_fuzzy", confidence: "high" };
+    }
   }
+
+  // ── Method 2: Retell disconnection_reason (fallback) ──────────────────────
   const reason = (callData.disconnection_reason || "").toLowerCase();
   const durationMs = callData.duration_ms || 0;
   const hasTranscript = !!(callData.transcript && callData.transcript.length > 50);
-  if (reason === "dial_no_answer" || reason === "no_answer") return { disposition: "no_answer", method: "disconnection_reason", confidence: "high" };
-  if (reason === "dial_busy") return { disposition: "no_answer", method: "disconnection_reason", confidence: "high" };
-  if (reason === "machine_detected" || reason === "voicemail_reach") return { disposition: "voicemail_left", method: "disconnection_reason", confidence: "medium" };
-  if (reason === "dial_failed" || reason === "line_busy") return { disposition: "call_failed", method: "disconnection_reason", confidence: "high" };
-  if (reason.startsWith("error_") || reason === "unknown_error") return { disposition: "call_failed", method: "disconnection_reason", confidence: "high" };
+
+  // Clear-cut cases from Retell's disconnection reasons
+  if (reason === "dial_no_answer" || reason === "no_answer") {
+    return { disposition: "no_answer", method: "disconnection_reason", confidence: "high" };
+  }
+  if (reason === "dial_busy") {
+    return { disposition: "no_answer", method: "disconnection_reason", confidence: "high" };
+  }
+  if (reason === "machine_detected" || reason === "voicemail_reach") {
+    return { disposition: "voicemail_left", method: "disconnection_reason", confidence: "medium" };
+  }
+  if (reason === "dial_failed" || reason === "line_busy") {
+    return { disposition: "call_failed", method: "disconnection_reason", confidence: "high" };
+  }
+  if (reason.startsWith("error_") || reason === "unknown_error") {
+    return { disposition: "call_failed", method: "disconnection_reason", confidence: "high" };
+  }
+
+  // Ambiguous cases — call connected but we don't know outcome
   if (reason === "user_hangup" || reason === "agent_hangup" || reason === "inactivity") {
-    if (durationMs < 15000 && !hasTranscript) return { disposition: "no_answer", method: "short_call_heuristic", confidence: "low" };
+    // Very short call with no meaningful transcript → likely no real contact
+    if (durationMs < 15000 && !hasTranscript) {
+      return { disposition: "no_answer", method: "short_call_heuristic", confidence: "low" };
+    }
+    // Call had real conversation but no call_analysis → can't determine outcome
+    // Default to "call_failed" with review flag so human can check
     return { disposition: "call_failed", method: "no_analysis_fallback", confidence: "low" };
   }
+
+  // Unknown disconnection reason
   return { disposition: "call_failed", method: "unknown", confidence: "low" };
 }
 
+/**
+ * Handle an Aria call_ended event: extract disposition and POST to Zoho Flow webhook.
+ */
 async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
   const dynVars = callData.retell_llm_dynamic_variables || {};
   const zohoLeadId = dynVars.zoho_lead_id || null;
@@ -300,33 +359,59 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
 
   console.log(`  [ARIA] Call ended for ${agentLabel} | lead: ${zohoLeadId || "(unknown)"} | prospect: ${prospectName}`);
 
+  // We need zoho_lead_id to update the CRM record
   if (!zohoLeadId) {
-    console.warn(`  [ARIA] No zoho_lead_id — cannot update Zoho CRM. Call: ${callId}`);
+    console.warn(`  [ARIA] No zoho_lead_id in dynamic variables — cannot update Zoho CRM. Call: ${callId}`);
+    console.warn(`  [ARIA] Dynamic variables received:`, JSON.stringify(dynVars));
     await pool.query(
-      `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, 'high', 'aria_call_ended', 'skipped')`,
-      [`Aria call missing zoho_lead_id: ${prospectName || callId}`, JSON.stringify({ call_id: callId, agent: agentLabel, dynamic_vars: dynVars })]
+      `INSERT INTO notifications (subject, body, priority, source, status)
+       VALUES ($1, $2, 'high', 'aria_call_ended', 'skipped')`,
+      [
+        `Aria call missing zoho_lead_id: ${prospectName || callId}`,
+        JSON.stringify({ call_id: callId, agent: agentLabel, dynamic_vars: dynVars }),
+      ]
     );
     return;
   }
 
+  // Map the disposition
   const { disposition, method, confidence } = mapAriaDisposition(callData, callAnalysis);
+
+  // Build call summary for the notes field
   const durationSec = Math.round((callData.duration_ms || 0) / 1000);
   const disconnectReason = callData.disconnection_reason || "unknown";
   const analysisSummary = callAnalysis?.call_summary || callAnalysis?.summary || "";
-  const notes = [analysisSummary, `Duration: ${durationSec}s`, `Disconnect: ${disconnectReason}`, `Disposition method: ${method} (${confidence})`].filter(Boolean).join(". ");
+  const notes = [
+    analysisSummary,
+    `Duration: ${durationSec}s`,
+    `Disconnect: ${disconnectReason}`,
+    `Disposition method: ${method} (${confidence})`,
+  ].filter(Boolean).join(". ");
+
+  // Extract prospect email from call_analysis if available
   const prospectEmail = callAnalysis?.prospect_email || callAnalysis?.email || dynVars.prospect_email || "";
 
   console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | lead: ${zohoLeadId}`);
 
+  // POST to Zoho Flow webhook
   if (!ZOHO_FLOW_ARIA_END_CALL_URL) {
     console.error(`  [ARIA] ZOHO_FLOW_ARIA_END_CALL_URL not configured — skipping Zoho Flow POST`);
     return;
   }
 
   const zohoPayload = {
-    lead_id: zohoLeadId, disposition, notes, prospect_email: prospectEmail,
-    call_id: callId, agent: agentLabel, confidence, method, duration_sec: durationSec,
-    prospect_name: prospectName, university_name: universityName,
+    lead_id: zohoLeadId,
+    disposition: disposition,
+    notes: notes,
+    prospect_email: prospectEmail,
+    // Extra context for debugging / future use
+    call_id: callId,
+    agent: agentLabel,
+    confidence: confidence,
+    method: method,
+    duration_sec: durationSec,
+    prospect_name: prospectName,
+    university_name: universityName,
   };
 
   const response = await fetch(ZOHO_FLOW_ARIA_END_CALL_URL, {
@@ -341,12 +426,19 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
   }
 
   console.log(`  [ARIA] Zoho Flow webhook accepted (${response.status}) for lead ${zohoLeadId}`);
+
+  // Log success
   await pool.query(
-    `INSERT INTO notifications (subject, body, priority, source, status) VALUES ($1, $2, 'normal', 'aria_call_ended', 'sent')`,
-    [`Aria ${disposition}: ${prospectName} @ ${universityName}`, JSON.stringify(zohoPayload)]
+    `INSERT INTO notifications (subject, body, priority, source, status)
+     VALUES ($1, $2, 'normal', 'aria_call_ended', 'sent')`,
+    [
+      `Aria ${disposition}: ${prospectName} @ ${universityName}`,
+      JSON.stringify(zohoPayload),
+    ]
   );
 }
 
+// ─── Main webhook endpoint ────────────────────────────────────────────────────
 app.post("/webhooks/retell", async (req, res) => {
   const receivedAt = new Date().toISOString();
 
@@ -920,7 +1012,7 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   if (!prospect.zoho_lead_id) {
     console.warn(`[ZOHO] WARNING: zoho_lead_id is null — Zoho Flow webhook body may not include 'id' or 'lead_id'. Received keys: ${Object.keys(zohoLead).join(", ")}`);
   }
-  console.log(`→ [ZOHO] Aria trigger: ${prospect.contact_name} @ ${prospect.university_name} → ${agentKey} (lead: ${prospect.zoho_lead_id})`);
+  console.log(`→ [ZOHO] Aria trigger: ${prospect.contact_name} @ ${prospect.university_name} → ${agentKey} | specialist: ${prospect.specialist || "UNMAPPED"} | owner: ${prospect.lead_owner_name || "unknown"} (lead: ${prospect.zoho_lead_id})`);
 
   try {
     const result = await createBatchCall([prospect], {
@@ -951,15 +1043,13 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   }
 });
 
-// ─── Zoho CRM Status Callback (legacy — kept for backward compat) ────────────
+// ─── Zoho CRM Status Callback (legacy — kept for backward compat) ───────────
+// NOTE: Aria call results are now handled automatically in /webhooks/retell
+// (see handleAriaCallEnded). This endpoint is kept for any direct API callers.
 app.post("/zoho/aria-result", requireAuth, async (req, res) => {
-  // NOTE: Aria call results are now handled automatically in /webhooks/retell
-  // (see handleAriaCallEnded). This endpoint is kept for any direct API callers.
-
   const { zoho_lead_id, call_id, status, transcript_summary } = req.body;
-  console.log(`→ [ZOHO] Aria result: lead=${zoho_lead_id} call=${call_id} status=${status}`);
+  console.log(`→ [ZOHO] Aria result (legacy endpoint): lead=${zoho_lead_id} call=${call_id} status=${status}`);
 
-  // Log for now — Phase 2 will push back to Zoho CRM API
   await pool.query(
     `INSERT INTO notifications (subject, body, priority, source, status)
      VALUES ($1, $2, 'normal', 'zoho_aria_result', 'logged')`,

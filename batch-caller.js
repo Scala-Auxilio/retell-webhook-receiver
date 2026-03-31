@@ -1,5 +1,5 @@
 /**
- * Scala Auxilium — Retell Batch Call Dispatcher
+ * Scala Auxilium â Retell Batch Call Dispatcher
  *
  * Reads a prospect list (JSON) and dispatches batch calls via Retell API.
  * Designed to be called from a simple upload endpoint or run standalone.
@@ -16,11 +16,11 @@
 const fs = require("fs");
 const path = require("path");
 
-// ─── Config ─────────────────────────────────────────────────────────────────
+// âââ Config âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 const RETELL_API_KEY = process.env.RETELL_API_KEY || null;
 const RETELL_API_BASE = "https://api.retellai.com";
 
-// Agent configs — maps friendly names to Retell agent IDs and phone numbers
+// Agent configs â maps friendly names to Retell agent IDs and phone numbers
 const AGENTS = {
   aria_en: {
     agent_id: "agent_aa56b68b02f6de4ac5725a829b",
@@ -34,11 +34,11 @@ const AGENTS = {
   },
 };
 
-// CET calling window: Mon–Fri 09:00–17:00
+// CET calling window: MonâFri 09:00â17:00
 const CALLING_WINDOW = {
   timezone: "Europe/Amsterdam",
   windows: [
-    { day: 1, start_min: 540, end_min: 1020 }, // Mon 09:00–17:00
+    { day: 1, start_min: 540, end_min: 1020 }, // Mon 09:00â17:00
     { day: 2, start_min: 540, end_min: 1020 }, // Tue
     { day: 3, start_min: 540, end_min: 1020 }, // Wed
     { day: 4, start_min: 540, end_min: 1020 }, // Thu
@@ -46,7 +46,7 @@ const CALLING_WINDOW = {
   ],
 };
 
-// ─── Zoho CRM Lead → Prospect mapping ───────────────────────────────────────
+// âââ Zoho CRM Lead â Prospect mapping âââââââââââââââââââââââââââââââââââââââ
 // Zoho Flow sends lead data in Zoho CRM field names. This maps to our format.
 function mapZohoLead(zohoLead) {
   const firstName = zohoLead.First_Name || zohoLead.first_name || "";
@@ -57,12 +57,12 @@ function mapZohoLead(zohoLead) {
   return {
     phone_number: zohoLead.Phone || zohoLead.phone || "",
     university_name: zohoLead.Educational_Institute || zohoLead.Educational_institute || zohoLead.Company || zohoLead.company || "",
-    // Retell agent uses {{prospect_first_name}} — keep first/last split
+    // Retell agent uses {{prospect_first_name}} â keep first/last split
     first_name: firstName,
     last_name: lastName,
     contact_name: [firstName, lastName].filter(Boolean).join(" "),
     contact_title: jobTitle,
-    // Retell agent uses {{persona_type}} — derive from edu_level or job title
+    // Retell agent uses {{persona_type}} â derive from edu_level or job title
     persona_type: derivePersonaType(eduLevel, jobTitle),
     department: zohoLead.Segment || zohoLead.segment || "",
     country: zohoLead.Country || zohoLead.country || "",
@@ -104,7 +104,7 @@ function agentFromAriaStatus(ariaStatus) {
   return null;
 }
 
-// ─── Validation ─────────────────────────────────────────────────────────────
+// âââ Validation âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 function validateE164(phone) {
   return /^\+[1-9]\d{6,14}$/.test(phone);
@@ -113,12 +113,12 @@ function validateE164(phone) {
 function validateProspect(prospect, index) {
   const errors = [];
   if (!prospect.phone_number) errors.push(`Row ${index}: missing phone_number`);
-  else if (!validateE164(prospect.phone_number)) errors.push(`Row ${index}: invalid E.164 format '${prospect.phone_number}' — must be +[country][number]`);
+  else if (!validateE164(prospect.phone_number)) errors.push(`Row ${index}: invalid E.164 format '${prospect.phone_number}' â must be +[country][number]`);
   if (!prospect.university_name && !prospect.contact_name) errors.push(`Row ${index}: need at least university_name or contact_name`);
   return errors;
 }
 
-// ─── Build Retell batch call payload ────────────────────────────────────────
+// âââ Build Retell batch call payload ââââââââââââââââââââââââââââââââââââââââ
 
 function buildBatchPayload(prospects, agentKey, options = {}) {
   const agent = AGENTS[agentKey];
@@ -135,16 +135,18 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
   const tasks = prospects.map((p) => ({
     to_number: p.phone_number,
     retell_llm_dynamic_variables: {
-      // ── Variables used by Retell agent flow nodes ──
+      // ââ Variables used by Retell agent flow nodes ââ
       prospect_first_name: getFirstName(p),           // Confirm Contact, Opener, Closing
       university_name: p.university_name || "",        // Confirm Contact, Book Meeting CTA
       persona_type: p.persona_type || "faculty",       // Opener, Qualify, Value Pitch
-      // ── Extra context (available to global prompt / knowledge base) ──
+      // ââ Extra context (available to global prompt / knowledge base) ââ
       contact_name: p.contact_name || "",
       contact_title: p.contact_title || "",
       department: p.department || "",
       sendsteps_product: p.sendsteps_product || "Interactive Presentations",
       notes: p.notes || "",
+      // ── Zoho CRM tracking (round-trips back in call_ended webhook) ──
+      zoho_lead_id: p.zoho_lead_id || "",
     },
   }));
 
@@ -152,7 +154,7 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
     agent_id: agent.agent_id,
     from_number: agent.from_number,
     tasks,
-    name: options.name || `Sendsteps ${agentKey.toUpperCase()} batch — ${new Date().toISOString().split("T")[0]}`,
+    name: options.name || `Sendsteps ${agentKey.toUpperCase()} batch â ${new Date().toISOString().split("T")[0]}`,
   };
 
   // Add calling window
@@ -175,7 +177,7 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
   return payload;
 }
 
-// ─── API call ───────────────────────────────────────────────────────────────
+// âââ API call âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 async function createBatchCall(prospects, options = {}) {
   const agentKey = options.agent || "aria_en";
@@ -231,7 +233,7 @@ async function createBatchCall(prospects, options = {}) {
   };
 }
 
-// ─── Parse prospect list from JSON file ─────────────────────────────────────
+// âââ Parse prospect list from JSON file âââââââââââââââââââââââââââââââââââââ
 
 function parseProspectList(filePath) {
   const raw = fs.readFileSync(filePath, "utf-8");
@@ -240,7 +242,7 @@ function parseProspectList(filePath) {
   return Array.isArray(data) ? data : data.prospects || data.tasks || [];
 }
 
-// ─── CLI ────────────────────────────────────────────────────────────────────
+// âââ CLI ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 async function main() {
   const args = process.argv.slice(2);

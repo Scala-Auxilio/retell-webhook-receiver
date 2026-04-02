@@ -272,7 +272,7 @@ app.get("/health", async (_req, res) => {
  * Dispositions: no_answer, voicemail_left, meeting_booked, callback_requested,
  *               not_interested, wrong_person, referral_given, call_failed,
  *               email_followup, warm_nurture, internal_discussion,
- *               transfer_succeeded, transfer_failed_no_action
+ *               transfer_succeeded, transfer_failed_no_action, existing_customer
  */
 function mapAriaDisposition(callData, callAnalysis) {
   // ── Method 1: Post-Call Analysis (if enabled on the Retell agent) ──────────
@@ -283,7 +283,7 @@ function mapAriaDisposition(callData, callAnalysis) {
       "no_answer", "voicemail_left", "meeting_booked", "callback_requested",
       "not_interested", "wrong_person", "referral_given", "call_failed",
       "email_followup", "warm_nurture", "internal_discussion",
-      "transfer_succeeded", "transfer_failed_no_action",
+      "transfer_succeeded", "transfer_failed_no_action", "existing_customer",
     ];
     if (validDispositions.includes(outcome)) {
       return { disposition: outcome, method: "call_analysis", confidence: "high" };
@@ -328,6 +328,9 @@ function mapAriaDisposition(callData, callAnalysis) {
     }
     if (/transfer.fail|could.not.connect|nobody.available/i.test(outcome)) {
       return { disposition: "transfer_failed_no_action", method: "call_analysis_fuzzy", confidence: "medium" };
+    }
+    if (/existing.customer|already.use|already.have|already.using|current.customer/i.test(outcome)) {
+      return { disposition: "existing_customer", method: "call_analysis_fuzzy", confidence: "high" };
     }
   }
 

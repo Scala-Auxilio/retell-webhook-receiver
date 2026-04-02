@@ -263,23 +263,27 @@ app.get("/health", async (_req, res) => {
 // ─── Aria Call-Ended → Zoho Flow Disposition Mapping ─────────────────────────
 
 /**
- * Map a Retell call_ended event to one of our 8 Zoho CRM dispositions.
+ * Map a Retell call_ended event to one of our 13 Zoho CRM dispositions.
  *
  * Priority order:
  *   1. call_analysis.call_outcome  (Retell Post-Call Analysis — most reliable)
  *   2. disconnection_reason        (Retell call metadata — fallback)
  *
  * Dispositions: no_answer, voicemail_left, meeting_booked, callback_requested,
- *               not_interested, wrong_person, referral_given, call_failed
+ *               not_interested, wrong_person, referral_given, call_failed,
+ *               email_followup, warm_nurture, internal_discussion,
+ *               transfer_succeeded, transfer_failed_no_action
  */
 function mapAriaDisposition(callData, callAnalysis) {
   // ── Method 1: Post-Call Analysis (if enabled on the Retell agent) ──────────
   if (callAnalysis) {
     const outcome = (callAnalysis.call_outcome || callAnalysis.outcome || "").toLowerCase().trim();
-    // Direct match against our 8 dispositions
+    // Direct match against our 13 dispositions
     const validDispositions = [
       "no_answer", "voicemail_left", "meeting_booked", "callback_requested",
       "not_interested", "wrong_person", "referral_given", "call_failed",
+      "email_followup", "warm_nurture", "internal_discussion",
+      "transfer_succeeded", "transfer_failed_no_action",
     ];
     if (validDispositions.includes(outcome)) {
       return { disposition: outcome, method: "call_analysis", confidence: "high" };
@@ -308,6 +312,22 @@ function mapAriaDisposition(callData, callAnalysis) {
     }
     if (/fail|error|technical/i.test(outcome)) {
       return { disposition: "call_failed", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    // New disposition fuzzy matchers (April 2026 structural fixes)
+    if (/email.follow|send.email|just.email|email.info/i.test(outcome)) {
+      return { disposition: "email_followup", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    if (/nurture|warm|not.ready|next.semester|revisit|think.about/i.test(outcome)) {
+      return { disposition: "warm_nurture", method: "call_analysis_fuzzy", confidence: "medium" };
+    }
+    if (/internal.discussion|check.with|colleague|department|run.this.by|team.decision/i.test(outcome)) {
+      return { disposition: "internal_discussion", method: "call_analysis_fuzzy", confidence: "medium" };
+    }
+    if (/transfer.success|handed.off|connected.to.human|human.took.over/i.test(outcome)) {
+      return { disposition: "transfer_succeeded", method: "call_analysis_fuzzy", confidence: "high" };
+    }
+    if (/transfer.fail|could.not.connect|nobody.available/i.test(outcome)) {
+      return { disposition: "transfer_failed_no_action", method: "call_analysis_fuzzy", confidence: "medium" };
     }
   }
 

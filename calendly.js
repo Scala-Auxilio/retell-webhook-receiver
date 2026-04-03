@@ -27,12 +27,12 @@ const SPECIALISTS = {
   rogier: {
     name: "Rogier",
     event_type_uri: process.env.CALENDLY_EVENT_TYPE_ROGIER || null,
-    fallback_url: process.env.CALENDLY_FALLBACK_URL_ROGIER || "https://calendly.com/sendsteps/rogier-demo",
+    fallback_url: process.env.CALENDLY_FALLBACK_URL_ROGIER || "https://calendly.com/rogier-smulders-sendsteps",
   },
   mike: {
     name: "Mike",
     event_type_uri: process.env.CALENDLY_EVENT_TYPE_MIKE || null,
-    fallback_url: process.env.CALENDLY_FALLBACK_URL_MIKE || "https://calendly.com/sendsteps/mike-demo",
+    fallback_url: process.env.CALENDLY_FALLBACK_URL_MIKE || "https://calendly.com/mike-coumans-sendsteps",
   },
 };
 

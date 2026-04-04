@@ -115,6 +115,8 @@ function mapZohoLead(zohoLead) {
     edu_level: eduLevel,
     type_of_plan: zohoLead.Type_of_Plan || zohoLead.type_of_plan || "",
     language: zohoLead.Language || zohoLead.language || "",
+    // Email — used by Retell agent to pre-fill booking invite address
+    email: zohoLead.Email || zohoLead.email || "",
     // Calendly specialist routing (derived from Lead Owner)
     specialist: specialist,
     lead_owner_name: ownerObj ? (ownerObj.name || "") : "",
@@ -192,6 +194,8 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
       department: p.department || "",
       sendsteps_product: p.sendsteps_product || "Interactive Presentations",
       notes: p.notes || "",
+      // ── Email (pre-fills invite address so Aria doesn't need to ask) ──
+      prospect_email: p.email || "",
       // ── Zoho CRM tracking (round-trips back in call_ended webhook) ──
       zoho_lead_id: p.zoho_lead_id || "",
     },

@@ -81,7 +81,7 @@ function mapZohoLead(zohoLead) {
     country: zohoLead.Country || zohoLead.country || "",
     sendsteps_product: zohoLead.Sendsteps_Product || zohoLead.sendsteps_product || "Interactive Presentations",
     notes: zohoLead.Description || zohoLead.description || "",
-    zoho_lead_id: zohoLead.id || zohoLead.Id || zohoLead.lead_id || zohoLead.Lead_Id || zohoLead.LEADID || zohoLead.Lead_ID || null,
+    zoho_lead_id: zohoLead.ID || zohoLead.id || zohoLead.Id || zohoLead.lead_id || zohoLead.Lead_Id || zohoLead.LEADID || zohoLead.Lead_ID || null, // Zoho Flow Deluge uses "ID" (all-caps); CRM API v2 uses "id"
     edu_level: eduLevel,
     type_of_plan: zohoLead.Type_of_Plan || zohoLead.type_of_plan || "",
     language: zohoLead.Language || zohoLead.language || "",

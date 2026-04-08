@@ -433,7 +433,7 @@ async function getZohoAccessToken() {
  * Update a Zoho CRM Lead with the Aria call outcome.
  * Resolves the record by zohoLeadId first; falls back to email search.
  */
-async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes, callId }) {
+async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes, callId, extraFields = {} }) {
   const token = await getZohoAccessToken();
   const headers = {
     Authorization: `Zoho-oauthtoken ${token}`,
@@ -471,6 +471,7 @@ async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes,
       Aria_Status:         ariaStatus,
       Aria_Notes:          notes,
       Aria_Last_Call_Date: new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00'),
+      ...extraFields,
     }],
   };
   const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
@@ -485,6 +486,41 @@ async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes,
   }
   console.log(`  [ZOHO] Lead updated | id: ${recordId} | Aria_Status: ${ariaStatus} | status: ${result?.status}`);
   return { recordId, result };
+}
+
+// Dispositions where the person didn't engage — treated as "no answer" for retry logic
+const NO_ANSWER_DISPOSITIONS = new Set(["no_answer", "no_analysis_fallback"]);
+
+const ATTEMPT_STATUS_MAP = {
+  1: "Attempt 1 - No Answer",
+  2: "Attempt 2 - No Answer",
+  3: "Attempt 3 - No Answer",
+};
+
+/**
+ * Fetch a lead's current Aria_Attempt_Count from Zoho CRM.
+ * Uses lead ID if available, falls back to email search.
+ */
+async function fetchAttemptCount(zohoLeadId, prospectEmail) {
+  const token = await getZohoAccessToken();
+  const headers = { Authorization: `Zoho-oauthtoken ${token}` };
+
+  if (zohoLeadId) {
+    const res = await fetch(`${ZOHO_CRM_BASE}/Leads/${zohoLeadId}?fields=id,Aria_Attempt_Count`, { headers });
+    if (res.ok) {
+      const data = await res.json();
+      return data?.data?.[0]?.Aria_Attempt_Count || 0;
+    }
+  }
+  if (prospectEmail) {
+    const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=(Email:equals:${encodeURIComponent(prospectEmail)})&fields=id,Aria_Attempt_Count`;
+    const res = await fetch(searchUrl, { headers });
+    if (res.ok) {
+      const data = await res.json();
+      return data?.data?.[0]?.Aria_Attempt_Count || 0;
+    }
+  }
+  return 0;
 }
 
 /**
@@ -536,8 +572,28 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
 
   console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | lead: ${zohoLeadId || "(via email)"}`);
 
-  // Resolve the final Zoho CRM Aria_Status picklist value
-  const ariaStatus = DISPOSITION_TO_ARIA_STATUS[disposition] || "Failed";
+  // Resolve the final Zoho CRM Aria_Status picklist value and any extra fields
+  let ariaStatus;
+  let extraFields = {};
+
+  if (NO_ANSWER_DISPOSITIONS.has(disposition)) {
+    // Hung up early or no answer — treat identically: increment attempt count, schedule retry
+    const currentCount = await fetchAttemptCount(zohoLeadId, prospectEmail);
+    const newCount = currentCount + 1;
+    ariaStatus = ATTEMPT_STATUS_MAP[newCount] || "Max Attempts - Nurture";
+
+    const retryDate = new Date();
+    retryDate.setDate(retryDate.getDate() + Math.min(newCount, 3));
+
+    extraFields = {
+      Aria_Attempt_Count:   newCount,
+      Aria_Next_Retry_Date: retryDate.toISOString().split("T")[0], // YYYY-MM-DD
+      Aria_Callback_Time:   "09:00",
+    };
+    console.log(`  [ARIA] No-answer flow | attempt: ${newCount} | status: ${ariaStatus} | retry: ${extraFields.Aria_Next_Retry_Date}`);
+  } else {
+    ariaStatus = DISPOSITION_TO_ARIA_STATUS[disposition] || "Failed";
+  }
 
   // Update Zoho CRM directly via API
   const crmResult = await updateZohoCRMLead({
@@ -546,6 +602,7 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     ariaStatus,
     notes,
     callId,
+    extraFields,
   });
 
   // Log success to DB

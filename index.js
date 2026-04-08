@@ -470,7 +470,7 @@ async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes,
       id: recordId,
       Aria_Status:         ariaStatus,
       Aria_Notes:          notes,
-      Aria_Last_Call_Date: new Date().toISOString(),
+      Aria_Last_Call_Date: new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00'),
     }],
   };
   const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {

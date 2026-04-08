@@ -528,7 +528,7 @@ async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes,
 }
 
 // Dispositions where the person didn't engage — treated as "no answer" for retry logic
-const NO_ANSWER_DISPOSITIONS = new Set(["no_answer", "no_analysis_fallback", "voicemail"]);
+const NO_ANSWER_DISPOSITIONS = new Set(["no_answer", "no_analysis_fallback", "voicemail", "voicemail_left"]);
 
 const ATTEMPT_STATUS_MAP = {
   1: "Attempt 1 - No Answer",

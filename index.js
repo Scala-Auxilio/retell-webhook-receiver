@@ -371,6 +371,24 @@ function mapAriaDisposition(callData, callAnalysis) {
   return { disposition: "call_failed", method: "unknown", confidence: "low" };
 }
 
+// Maps Railway disposition codes to Zoho CRM Aria_Status picklist values
+const DISPOSITION_TO_ARIA_STATUS = {
+  "meeting_booked":            "Completed - Meeting Booked",
+  "not_interested":            "Completed - Not Interested",
+  "voicemail":                 "Completed - Voicemail",
+  "no_answer":                 "Completed - No Answer",
+  "call_failed":               "Failed",
+  "email_followup":            "Completed - Email Follow-up",
+  "warm_nurture":              "Completed - Warm Nurture",
+  "internal_discussion":       "Completed - Internal Discussion",
+  "transfer_succeeded":        "Completed - Transfer to Human",
+  "transfer_failed_no_action": "Completed - Transfer Failed",
+  "call_back_scheduled":       "Call back Scheduled",
+  "existing_customer":         "Existing Customer",
+  "referral_given":            "Completed - Referral Given",
+  "wrong_person":              "Completed - Wrong Person",
+};
+
 /**
  * Handle an Aria call_ended event: extract disposition and POST to Zoho Flow webhook.
  */
@@ -425,9 +443,12 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     return;
   }
 
+  const ariaStatus = DISPOSITION_TO_ARIA_STATUS[disposition] || "Failed";
+
   const zohoPayload = {
     lead_id: zohoLeadId,
     disposition: disposition,
+    aria_status: ariaStatus,
     notes: notes,
     prospect_email: prospectEmail,
     // Extra context for debugging / future use
@@ -451,7 +472,7 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     throw new Error(`Zoho Flow webhook returned ${response.status}: ${errText}`);
   }
 
-  console.log(`  [ARIA] Zoho Flow webhook accepted (${response.status}) for lead ${zohoLeadId}`);
+  console.log(`  [ARIA] Zoho Flow webhook accepted (${response.status}) | lead: ${zohoLeadId || "(email: " + prospectEmail + ")"} | aria_status: ${ariaStatus}`);
 
   // Log success
   await pool.query(

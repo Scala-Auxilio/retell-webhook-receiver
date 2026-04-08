@@ -17,8 +17,15 @@ const NOTIFY_FROM = process.env.NOTIFY_FROM || "notifications@adsum-auxilio.com"
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 
-// ─── Zoho Flow Webhook (Aria End Call) ───────────────────────────────────────
-const ZOHO_FLOW_ARIA_END_CALL_URL = process.env.ZOHO_FLOW_ARIA_END_CALL_URL || null;
+// ─── Zoho CRM Direct API (Aria End Call) ─────────────────────────────────────
+const ZOHO_CLIENT_ID     = process.env.ZOHO_CLIENT_ID     || null;
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET || null;
+const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || null;
+const ZOHO_CRM_BASE      = "https://www.zohoapis.eu/crm/v2";
+const ZOHO_OAUTH_BASE    = "https://accounts.zoho.eu/oauth/v2";
+
+// In-memory token cache (refreshed automatically when expired)
+let zohoTokenCache = { token: null, expiresAt: 0 };
 
 // ─── EconoWind Lead Routing Config ──────────────────────────────────────────
 const ECONOWIND_MANAGERS = {
@@ -371,7 +378,7 @@ function mapAriaDisposition(callData, callAnalysis) {
   return { disposition: "call_failed", method: "unknown", confidence: "low" };
 }
 
-// Maps Railway disposition codes to Zoho CRM Aria_Status picklist values
+// Maps Railway disposition codes → Zoho CRM Aria_Status picklist values
 const DISPOSITION_TO_ARIA_STATUS = {
   "meeting_booked":            "Completed - Meeting Booked",
   "not_interested":            "Completed - Not Interested",
@@ -390,7 +397,98 @@ const DISPOSITION_TO_ARIA_STATUS = {
 };
 
 /**
- * Handle an Aria call_ended event: extract disposition and POST to Zoho Flow webhook.
+ * Return a valid Zoho CRM access token, refreshing via OAuth when expired.
+ */
+async function getZohoAccessToken() {
+  if (zohoTokenCache.token && Date.now() < zohoTokenCache.expiresAt - 60_000) {
+    return zohoTokenCache.token;
+  }
+  if (!ZOHO_CLIENT_ID || !ZOHO_CLIENT_SECRET || !ZOHO_REFRESH_TOKEN) {
+    throw new Error("Zoho OAuth env vars not configured (ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET / ZOHO_REFRESH_TOKEN)");
+  }
+  const params = new URLSearchParams({
+    grant_type:    "refresh_token",
+    client_id:     ZOHO_CLIENT_ID,
+    client_secret: ZOHO_CLIENT_SECRET,
+    refresh_token: ZOHO_REFRESH_TOKEN,
+  });
+  const res = await fetch(`${ZOHO_OAUTH_BASE}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error(`Zoho token refresh failed: ${JSON.stringify(data)}`);
+  }
+  zohoTokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
+  };
+  console.log(`  [ZOHO] Access token refreshed (expires in ${data.expires_in}s)`);
+  return data.access_token;
+}
+
+/**
+ * Update a Zoho CRM Lead with the Aria call outcome.
+ * Resolves the record by zohoLeadId first; falls back to email search.
+ */
+async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes, callId }) {
+  const token = await getZohoAccessToken();
+  const headers = {
+    Authorization: `Zoho-oauthtoken ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  let recordId = zohoLeadId;
+
+  // 1. If no direct ID, search by email
+  if (!recordId && prospectEmail) {
+    const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=(Email:equals:${encodeURIComponent(prospectEmail)})&fields=id`;
+    const searchRes = await fetch(searchUrl, { headers });
+    if (searchRes.ok) {
+      const searchData = await searchRes.json();
+      recordId = searchData?.data?.[0]?.id || null;
+      if (recordId) {
+        console.log(`  [ZOHO] Resolved lead by email ${prospectEmail} → id ${recordId}`);
+      } else {
+        console.warn(`  [ZOHO] No lead found for email ${prospectEmail}`);
+      }
+    } else {
+      const errText = await searchRes.text().catch(() => "");
+      console.warn(`  [ZOHO] Lead search failed (${searchRes.status}): ${errText}`);
+    }
+  }
+
+  if (!recordId) {
+    throw new Error(`Cannot update Zoho CRM: no lead resolved (call: ${callId}, email: ${prospectEmail})`);
+  }
+
+  // 2. Update the lead record with Aria fields
+  const updateBody = {
+    data: [{
+      id: recordId,
+      Aria_Status:         ariaStatus,
+      Aria_Notes:          notes,
+      Aria_Last_Call_Date: new Date().toISOString(),
+    }],
+  };
+  const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify(updateBody),
+  });
+  const updateData = await updateRes.json();
+  const result = updateData?.data?.[0];
+  if (result?.status === "error") {
+    throw new Error(`Zoho CRM update error: ${JSON.stringify(result)}`);
+  }
+  console.log(`  [ZOHO] Lead updated | id: ${recordId} | Aria_Status: ${ariaStatus} | status: ${result?.status}`);
+  return { recordId, result };
+}
+
+/**
+ * Handle an Aria call_ended event: extract disposition and update Zoho CRM directly.
  */
 async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
   const dynVars = callData.retell_llm_dynamic_variables || {};
@@ -398,11 +496,12 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
   const prospectName = dynVars.prospect_first_name || dynVars.contact_name || "";
   const universityName = dynVars.university_name || "";
 
-  console.log(`  [ARIA] Call ended for ${agentLabel} | lead: ${zohoLeadId || "(unknown)"} | prospect: ${prospectName}`);
-
   // Extract prospect email early — used as fallback CRM identifier when zoho_lead_id is null
   const prospectEmail = callAnalysis?.prospect_email || callAnalysis?.email || dynVars.prospect_email || "";
-  // We need at least zoho_lead_id OR prospect_email to update the CRM record
+
+  console.log(`  [ARIA] Call ended for ${agentLabel} | lead: ${zohoLeadId || "(unknown)"} | prospect: ${prospectName}`);
+
+  // We need at least zoho_lead_id OR prospect_email to identify and update the CRM record
   if (!zohoLeadId && !prospectEmail) {
     console.warn(`  [ARIA] No zoho_lead_id or prospect_email — cannot update Zoho CRM. Call: ${callId}`);
     console.warn(`  [ARIA] Dynamic variables received:`, JSON.stringify(dynVars));
@@ -416,6 +515,7 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     );
     return;
   }
+
   if (!zohoLeadId) {
     console.warn(`  [ARIA] zoho_lead_id is null — will attempt CRM lookup by email (${prospectEmail})`);
   }
@@ -434,47 +534,37 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     `Disposition method: ${method} (${confidence})`,
   ].filter(Boolean).join(". ");
 
+  console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | lead: ${zohoLeadId || "(via email)"}`);
 
-  console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | lead: ${zohoLeadId}`);
-
-  // POST to Zoho Flow webhook
-  if (!ZOHO_FLOW_ARIA_END_CALL_URL) {
-    console.error(`  [ARIA] ZOHO_FLOW_ARIA_END_CALL_URL not configured — skipping Zoho Flow POST`);
-    return;
-  }
-
+  // Resolve the final Zoho CRM Aria_Status picklist value
   const ariaStatus = DISPOSITION_TO_ARIA_STATUS[disposition] || "Failed";
 
+  // Update Zoho CRM directly via API
+  const crmResult = await updateZohoCRMLead({
+    zohoLeadId,
+    prospectEmail,
+    ariaStatus,
+    notes,
+    callId,
+  });
+
+  // Log success to DB
   const zohoPayload = {
-    lead_id: zohoLeadId,
-    disposition: disposition,
+    lead_id:    zohoLeadId,
+    record_id:  crmResult.recordId,
+    disposition,
     aria_status: ariaStatus,
-    notes: notes,
+    notes,
     prospect_email: prospectEmail,
-    // Extra context for debugging / future use
-    call_id: callId,
-    agent: agentLabel,
-    confidence: confidence,
-    method: method,
+    call_id:    callId,
+    agent:      agentLabel,
+    confidence,
+    method,
     duration_sec: durationSec,
     prospect_name: prospectName,
     university_name: universityName,
   };
 
-  const response = await fetch(ZOHO_FLOW_ARIA_END_CALL_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(zohoPayload),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "(no body)");
-    throw new Error(`Zoho Flow webhook returned ${response.status}: ${errText}`);
-  }
-
-  console.log(`  [ARIA] Zoho Flow webhook accepted (${response.status}) | lead: ${zohoLeadId || "(email: " + prospectEmail + ")"} | aria_status: ${ariaStatus}`);
-
-  // Log success
   await pool.query(
     `INSERT INTO notifications (subject, body, priority, source, status)
      VALUES ($1, $2, 'normal', 'aria_call_ended', 'sent')`,
@@ -557,7 +647,7 @@ app.post("/webhooks/retell", async (req, res) => {
       }
     }
 
-    // ─── Aria (Sendsteps) call-end → forward result to Zoho Flow ────────────
+    // ─── Aria (Sendsteps) call-end → update Zoho CRM directly ──────────────
     const ARIA_AGENT_IDS = [
       "agent_aa56b68b02f6de4ac5725a829b", // Aria EN
       "agent_e1e1f763101db5abe0df281891", // Aria NL
@@ -566,7 +656,7 @@ app.post("/webhooks/retell", async (req, res) => {
       try {
         await handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt);
       } catch (ariaErr) {
-        console.error(`  [ARIA] Zoho Flow update failed:`, ariaErr.message);
+        console.error(`  [ARIA] Zoho CRM update failed:`, ariaErr.message);
         await pool.query(
           `INSERT INTO notifications (subject, body, priority, source, status, error)
            VALUES ($1, $2, $3, 'aria_call_ended', 'failed', $4)`,
@@ -1057,7 +1147,7 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   }
 
   if (!prospect.zoho_lead_id) {
-    console.warn(`[ZOHO] WARNING: zoho_lead_id is null — Zoho Flow webhook body may not include 'id' or 'lead_id'. Received keys: ${Object.keys(zohoLead).join(", ")}`);
+    console.warn(`[ZOHO] WARNING: zoho_lead_id is null — Zoho Flow webhook body may not include 'ID', 'id', or 'lead_id'. Received keys: ${Object.keys(zohoLead).join(", ")}`);
   }
   console.log(`→ [ZOHO] Aria trigger: ${prospect.contact_name} @ ${prospect.university_name} → ${agentKey} | specialist: ${prospect.specialist || "UNMAPPED"} | owner: ${prospect.lead_owner_name || "unknown"} (lead: ${prospect.zoho_lead_id})`);
 

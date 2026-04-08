@@ -339,6 +339,44 @@ function mapAriaDisposition(callData, callAnalysis) {
     if (/existing.customer|already.use|already.have|already.using|current.customer/i.test(outcome)) {
       return { disposition: "existing_customer", method: "call_analysis_fuzzy", confidence: "high" };
     }
+
+    // ── Dutch fuzzy matchers (Aria NL — post-call analysis returns Dutch text) ─
+    if (/demo.geboekt|vergadering.geboekt|afspraak.gemaakt|ingepland|gepland|geboekt/i.test(outcome)) {
+      return { disposition: "meeting_booked", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
+    if (/niet.ge.nteresseerd|geen.interesse|niet.relevant|niet.interessant|afgewezen/i.test(outcome)) {
+      return { disposition: "not_interested", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
+    if (/voicemail|ingesproken|bericht.ingesproken|voicemail.achtergelaten/i.test(outcome)) {
+      return { disposition: "voicemail_left", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
+    if (/geen.gehoor|niet.opgenomen|geen.antwoord|niet.bereikbaar/i.test(outcome)) {
+      return { disposition: "no_answer", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
+    if (/terugbellen|later.bellen|teruggebeld|callback|op.later.moment/i.test(outcome)) {
+      return { disposition: "callback_requested", method: "call_analysis_fuzzy_nl", confidence: "medium" };
+    }
+    if (/e-mail.sturen|mail.sturen|per.mail|informatie.sturen|link.sturen|calendly.sturen/i.test(outcome)) {
+      return { disposition: "email_followup", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
+    if (/niet.nu|verkeerd.moment|volgend.semester|later.moment|budget|contract.loopt|hervatten/i.test(outcome)) {
+      return { disposition: "warm_nurture", method: "call_analysis_fuzzy_nl", confidence: "medium" };
+    }
+    if (/overleggen|team.bespreken|collega.raadplegen|afdeling|intern.bespreken|manager/i.test(outcome)) {
+      return { disposition: "internal_discussion", method: "call_analysis_fuzzy_nl", confidence: "medium" };
+    }
+    if (/verkeerd.persoon|verkeerd.nummer|niet.de.juiste|doorverbinden|doorgestuurd/i.test(outcome)) {
+      return { disposition: "wrong_person", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
+    if (/bestaande.klant|al.klant|al.gebruik|gebruikt.al|al.in.gebruik/i.test(outcome)) {
+      return { disposition: "existing_customer", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
+    if (/doorverwezen|doorverwijzing|verwezen.naar|collega.aanbevolen/i.test(outcome)) {
+      return { disposition: "referral_given", method: "call_analysis_fuzzy_nl", confidence: "medium" };
+    }
+    if (/doorverbonden|overgedragen|collega.verbonden/i.test(outcome)) {
+      return { disposition: "transfer_succeeded", method: "call_analysis_fuzzy_nl", confidence: "high" };
+    }
   }
 
   // ── Method 2: Retell disconnection_reason (fallback) ──────────────────────
@@ -383,6 +421,7 @@ const DISPOSITION_TO_ARIA_STATUS = {
   "meeting_booked":            "Completed - Meeting Booked",
   "not_interested":            "Completed - Not Interested",
   "voicemail":                 "Completed - Voicemail",
+  "voicemail_left":            "Completed - Voicemail",   // alias — mapAriaDisposition returns this form
   "no_answer":                 "Completed - No Answer",
   "call_failed":               "Failed",
   "email_followup":            "Completed - Email Follow-up",

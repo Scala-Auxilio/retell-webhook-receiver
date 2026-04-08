@@ -382,19 +382,24 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
 
   console.log(`  [ARIA] Call ended for ${agentLabel} | lead: ${zohoLeadId || "(unknown)"} | prospect: ${prospectName}`);
 
-  // We need zoho_lead_id to update the CRM record
-  if (!zohoLeadId) {
-    console.warn(`  [ARIA] No zoho_lead_id in dynamic variables — cannot update Zoho CRM. Call: ${callId}`);
+  // Extract prospect email early — used as fallback CRM identifier when zoho_lead_id is null
+  const prospectEmail = callAnalysis?.prospect_email || callAnalysis?.email || dynVars.prospect_email || "";
+  // We need at least zoho_lead_id OR prospect_email to update the CRM record
+  if (!zohoLeadId && !prospectEmail) {
+    console.warn(`  [ARIA] No zoho_lead_id or prospect_email — cannot update Zoho CRM. Call: ${callId}`);
     console.warn(`  [ARIA] Dynamic variables received:`, JSON.stringify(dynVars));
     await pool.query(
       `INSERT INTO notifications (subject, body, priority, source, status)
        VALUES ($1, $2, 'high', 'aria_call_ended', 'skipped')`,
       [
-        `Aria call missing zoho_lead_id: ${prospectName || callId}`,
+        `Aria call missing zoho_lead_id and email: ${prospectName || callId}`,
         JSON.stringify({ call_id: callId, agent: agentLabel, dynamic_vars: dynVars }),
       ]
     );
     return;
+  }
+  if (!zohoLeadId) {
+    console.warn(`  [ARIA] zoho_lead_id is null — will attempt CRM lookup by email (${prospectEmail})`);
   }
 
   // Map the disposition
@@ -411,8 +416,6 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     `Disposition method: ${method} (${confidence})`,
   ].filter(Boolean).join(". ");
 
-  // Extract prospect email from call_analysis if available
-  const prospectEmail = callAnalysis?.prospect_email || callAnalysis?.email || dynVars.prospect_email || "";
 
   console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | lead: ${zohoLeadId}`);
 

@@ -24,6 +24,19 @@ const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || null;
 const ZOHO_CRM_BASE      = "https://www.zohoapis.eu/crm/v2";
 const ZOHO_OAUTH_BASE    = "https://accounts.zoho.eu/oauth/v2";
 
+// ─── Aria single-number flip mode (pilot-only; see docs/plans/2026-04-10-aria-number-flip-endpoints.md)
+// When true, the Dutch DID +31207163656 is shared between the EN and NL agents
+// and the operator must manually flip the binding between batches. Set to false
+// the moment a second Dutch DID is provisioned via VoIPStudio.
+const ARIA_FLIP_MODE    = process.env.ARIA_FLIP_MODE === "true";
+const ARIA_NL_DID       = "+31207163656";
+const RETELL_API_KEY    = process.env.RETELL_API_KEY || null;
+const RETELL_API_BASE   = "https://api.retellai.com";
+const AGENT_ID_TO_LABEL = {
+  [AGENTS.aria_en.agent_id]: "Aria EN",
+  [AGENTS.aria_nl.agent_id]: "Aria NL",
+};
+
 // In-memory token cache (refreshed automatically when expired)
 let zohoTokenCache = { token: null, expiresAt: 0 };
 
@@ -1266,6 +1279,127 @@ app.get("/batch-call/agents", (_req, res) => {
   });
 });
 
+// ─── Aria single-number flip helpers (pilot-only, see ARIA_FLIP_MODE) ────────
+// Reads the current outbound-agent binding for the shared NL DID.
+async function getCurrentNLNumberBinding() {
+  if (!RETELL_API_KEY) throw new Error("RETELL_API_KEY not set");
+  const resp = await fetch(`${RETELL_API_BASE}/list-phone-numbers`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Retell list-phone-numbers ${resp.status}: ${body}`);
+  }
+  const list = await resp.json();
+  const entry = (Array.isArray(list) ? list : []).find(p => p.phone_number === ARIA_NL_DID);
+  if (!entry) throw new Error(`NL DID ${ARIA_NL_DID} not found in Retell phone list`);
+  return {
+    phone_number: entry.phone_number,
+    outbound_agent_id: entry.outbound_agent_id,
+    agent_label: AGENT_ID_TO_LABEL[entry.outbound_agent_id] || "Unknown",
+  };
+}
+
+// Rebinds the NL DID to the Aria EN or Aria NL agent.
+async function updateNLNumberBinding(targetAgent) {
+  if (!RETELL_API_KEY) throw new Error("RETELL_API_KEY not set");
+  const agentKey = targetAgent === "EN" ? "aria_en"
+                 : targetAgent === "NL" ? "aria_nl"
+                 : null;
+  if (!agentKey) throw new Error(`Invalid targetAgent: '${targetAgent}' (expected 'EN' or 'NL')`);
+  const agentId = AGENTS[agentKey].agent_id;
+  const resp = await fetch(
+    `${RETELL_API_BASE}/update-phone-number/${encodeURIComponent(ARIA_NL_DID)}`,
+    {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${RETELL_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ outbound_agent_id: agentId }),
+    }
+  );
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Retell update-phone-number ${resp.status}: ${body}`);
+  }
+  // Re-read to confirm the change landed
+  return await getCurrentNLNumberBinding();
+}
+
+// ─── Aria flip endpoints (gated by ARIA_FLIP_MODE) ───────────────────────────
+// POST /aria/set-agent { agent: "EN" | "NL" }
+//   Flips the NL DID between the EN and NL Aria agents. Auth + flag guarded.
+app.post("/aria/set-agent", requireAuth, async (req, res) => {
+  if (!ARIA_FLIP_MODE) {
+    return res.status(403).json({ error: "ARIA_FLIP_MODE disabled" });
+  }
+  const target = (req.body && req.body.agent) || "";
+  if (target !== "EN" && target !== "NL") {
+    return res.status(400).json({ error: "Body must include { agent: 'EN' | 'NL' }" });
+  }
+  try {
+    const previous = await getCurrentNLNumberBinding().catch(() => null);
+    const next = await updateNLNumberBinding(target);
+    await pool.query(
+      `INSERT INTO notifications (subject, body, priority, source, status)
+       VALUES ($1, $2, 'normal', 'aria_binding_change', 'logged')`,
+      [
+        `Aria number rebound to ${next.agent_label}`,
+        JSON.stringify({
+          phone_number: ARIA_NL_DID,
+          previous_agent: previous ? previous.agent_label : null,
+          new_agent: next.agent_label,
+          previous_agent_id: previous ? previous.outbound_agent_id : null,
+          new_agent_id: next.outbound_agent_id,
+          triggered_by: "http_set_agent",
+        }),
+      ]
+    ).catch(err => console.error("  [ARIA-FLIP] audit insert failed:", err.message));
+    console.log(`→ [ARIA-FLIP] ${ARIA_NL_DID} bound to ${next.agent_label} (prev: ${previous ? previous.agent_label : "unknown"})`);
+    return res.json({
+      ok: true,
+      binding: next,
+      previous: previous || null,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error(`  [ARIA-FLIP] set-agent failed:`, err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /aria/binding-status
+//   Read-only. Returns the current Retell binding + most recent audit row.
+app.get("/aria/binding-status", requireAuth, async (_req, res) => {
+  if (!ARIA_FLIP_MODE) {
+    return res.status(403).json({ error: "ARIA_FLIP_MODE disabled" });
+  }
+  try {
+    const current = await getCurrentNLNumberBinding();
+    let lastChange = null;
+    try {
+      const { rows } = await pool.query(
+        `SELECT created_at, body FROM notifications
+         WHERE source = 'aria_binding_change'
+         ORDER BY id DESC LIMIT 1`
+      );
+      if (rows && rows[0]) {
+        let details = rows[0].body;
+        try { details = JSON.parse(rows[0].body); } catch { /* keep raw */ }
+        lastChange = { timestamp: rows[0].created_at, details };
+      }
+    } catch (qErr) {
+      console.error("  [ARIA-FLIP] audit query failed:", qErr.message);
+    }
+    return res.json({ current, last_change: lastChange });
+  } catch (err) {
+    console.error(`  [ARIA-FLIP] binding-status failed:`, err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Zoho Flow → Aria Pipeline (triggered when Aria_Status changes) ─────────
 app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   const zohoLead = req.body;
@@ -1281,6 +1415,30 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
 
   if (!agentKey) {
     return res.status(400).json({ error: `Cannot determine agent from Aria_Status: '${ariaStatus}'. Expected 'Ready for Aria EN' or 'Ready for Aria NL'.` });
+  }
+
+  // Aria flip-mode guard: refuse dispatch if the shared NL DID is currently
+  // bound to a different agent than the one this lead requires. The operator
+  // must call POST /aria/set-agent to flip the binding first. No auto-correct.
+  if (ARIA_FLIP_MODE) {
+    try {
+      const current = await getCurrentNLNumberBinding();
+      const requiredAgentId = AGENTS[agentKey].agent_id;
+      if (current.outbound_agent_id !== requiredAgentId) {
+        const requiredLabel = AGENT_ID_TO_LABEL[requiredAgentId] || agentKey;
+        console.warn(`  [ARIA-FLIP] Dispatch blocked: required ${requiredLabel} but NL DID is bound to ${current.agent_label}`);
+        return res.status(409).json({
+          error: "binding_mismatch",
+          required_agent: requiredLabel,
+          current_agent: current.agent_label,
+          hint: "Call POST /aria/set-agent with { agent: 'EN' | 'NL' } to flip the binding before dispatching.",
+          zoho_lead_id: prospect.zoho_lead_id,
+        });
+      }
+    } catch (bindErr) {
+      console.error(`  [ARIA-FLIP] binding check failed (allowing dispatch):`, bindErr.message);
+      // Fail-open on read error so a Retell API hiccup can't block the pilot.
+    }
   }
 
   // Validate phone number

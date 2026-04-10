@@ -213,7 +213,7 @@ function formatSlotsForVoice(availabilityData, timezone = "Europe/Amsterdam") {
   const spokenParts = topSlots.map((s) => {
     const dt = new Date(s.start_time);
     const dayStr = dateFormatter.format(dt);
-    const timeStr = dt.toLocaleTimeString("en-GB", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: timezone });
+    const timeStr = dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hourCycle: "h12", timeZone: timezone });
     return `${dayStr} at ${timeStr}`;
   });
 
@@ -383,7 +383,12 @@ function registerRoutes(app) {
    */
   app.post("/calendly/book", async (req, res) => {
     try {
-      const { specialist, start_time, name, email, timezone, notes, language } = req.body;
+      // Retell custom-function tools with args_at_root=false send { name, call, args: {...} }
+      // Accept both shapes so manual/curl callers still work.
+      const payload = (req.body && typeof req.body === "object" && req.body.args && typeof req.body.args === "object")
+        ? req.body.args
+        : (req.body || {});
+      const { specialist, start_time, name, email, timezone, notes, language } = payload;
 
       if (!start_time) {
         return res.status(400).json({ error: "Missing start_time" });
@@ -434,7 +439,7 @@ function registerRoutes(app) {
       const tz = timezone || "Europe/Amsterdam";
       const dt = new Date(start_time);
       const dateStr = dt.toLocaleDateString("en-GB", { weekday: "long", month: "long", day: "numeric", timeZone: tz });
-      const timeStr = dt.toLocaleTimeString("en-GB", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: tz });
+      const timeStr = dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hourCycle: "h12", timeZone: tz });
       const dateStrNL = dt.toLocaleDateString("nl-NL", { weekday: "long", month: "long", day: "numeric", timeZone: tz });
       const timeStrNL = dt.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit", timeZone: tz });
 
@@ -449,7 +454,8 @@ function registerRoutes(app) {
       });
     } catch (err) {
       console.error("[CALENDLY] Booking failed:", err.message);
-      const specKey = req.body.specialist || getDefaultSpecialist() || "rogier";
+      const _b = (req.body && req.body.args && typeof req.body.args === "object") ? req.body.args : (req.body || {});
+      const specKey = _b.specialist || getDefaultSpecialist() || "rogier";
       const spec = SPECIALISTS[specKey] || SPECIALISTS.rogier;
       res.json({
         booked: false,

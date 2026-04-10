@@ -1283,10 +1283,16 @@ app.get("/batch-call/agents", (_req, res) => {
 // Reads the current outbound-agent binding for the shared NL DID.
 async function getCurrentNLNumberBinding() {
   if (!RETELL_API_KEY) throw new Error("RETELL_API_KEY not set");
-  const resp = await fetch(`${RETELL_API_BASE}/list-phone-numbers`, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
-  });
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  let resp;
+  try {
+    resp = await fetch(`${RETELL_API_BASE}/list-phone-numbers`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
+      signal: ctrl.signal,
+    });
+  } finally { clearTimeout(t); }
   if (!resp.ok) {
     const body = await resp.text();
     throw new Error(`Retell list-phone-numbers ${resp.status}: ${body}`);
@@ -1309,28 +1315,43 @@ async function updateNLNumberBinding(targetAgent) {
                  : null;
   if (!agentKey) throw new Error(`Invalid targetAgent: '${targetAgent}' (expected 'EN' or 'NL')`);
   const agentId = AGENTS[agentKey].agent_id;
-  const resp = await fetch(
-    `${RETELL_API_BASE}/update-phone-number/${encodeURIComponent(ARIA_NL_DID)}`,
-    {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${RETELL_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ outbound_agent_id: agentId }),
-    }
-  );
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  let resp;
+  try {
+    resp = await fetch(
+      `${RETELL_API_BASE}/update-phone-number/${encodeURIComponent(ARIA_NL_DID)}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${RETELL_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ outbound_agent_id: agentId }),
+        signal: ctrl.signal,
+      }
+    );
+  } finally { clearTimeout(t); }
   if (!resp.ok) {
     const body = await resp.text();
     throw new Error(`Retell update-phone-number ${resp.status}: ${body}`);
   }
-  // Re-read to confirm the change landed
-  return await getCurrentNLNumberBinding();
+  // Re-read to confirm the change actually landed (not just accepted)
+  const verified = await getCurrentNLNumberBinding();
+  if (verified.outbound_agent_id !== agentId) {
+    throw new Error(
+      `Retell PATCH accepted but binding did not update: expected ${agentId}, got ${verified.outbound_agent_id}`
+    );
+  }
+  return verified;
 }
 
 // ─── Aria flip endpoints (gated by ARIA_FLIP_MODE) ───────────────────────────
 // POST /aria/set-agent { agent: "EN" | "NL" }
 //   Flips the NL DID between the EN and NL Aria agents. Auth + flag guarded.
+//   Serialized with an in-memory mutex so concurrent callers cannot race
+//   and corrupt the audit trail.
+let __ariaFlipInFlight = false;
 app.post("/aria/set-agent", requireAuth, async (req, res) => {
   if (!ARIA_FLIP_MODE) {
     return res.status(403).json({ error: "ARIA_FLIP_MODE disabled" });
@@ -1339,6 +1360,10 @@ app.post("/aria/set-agent", requireAuth, async (req, res) => {
   if (target !== "EN" && target !== "NL") {
     return res.status(400).json({ error: "Body must include { agent: 'EN' | 'NL' }" });
   }
+  if (__ariaFlipInFlight) {
+    return res.status(409).json({ error: "flip_in_progress", hint: "Another flip is currently running. Retry in a few seconds." });
+  }
+  __ariaFlipInFlight = true;
   try {
     const previous = await getCurrentNLNumberBinding().catch(() => null);
     const next = await updateNLNumberBinding(target);
@@ -1367,6 +1392,8 @@ app.post("/aria/set-agent", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(`  [ARIA-FLIP] set-agent failed:`, err.message);
     return res.status(500).json({ error: err.message });
+  } finally {
+    __ariaFlipInFlight = false;
   }
 });
 
@@ -1383,7 +1410,7 @@ app.get("/aria/binding-status", requireAuth, async (_req, res) => {
       const { rows } = await pool.query(
         `SELECT sent_at, body FROM notifications
          WHERE source = 'aria_binding_change'
-         ORDER BY id DESC LIMIT 1`
+         ORDER BY sent_at DESC, id DESC LIMIT 1`
       );
       if (rows && rows[0]) {
         let details = rows[0].body;

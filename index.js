@@ -1381,14 +1381,14 @@ app.get("/aria/binding-status", requireAuth, async (_req, res) => {
     let lastChange = null;
     try {
       const { rows } = await pool.query(
-        `SELECT created_at, body FROM notifications
+        `SELECT sent_at, body FROM notifications
          WHERE source = 'aria_binding_change'
          ORDER BY id DESC LIMIT 1`
       );
       if (rows && rows[0]) {
         let details = rows[0].body;
         try { details = JSON.parse(rows[0].body); } catch { /* keep raw */ }
-        lastChange = { timestamp: rows[0].created_at, details };
+        lastChange = { timestamp: rows[0].sent_at, details };
       }
     } catch (qErr) {
       console.error("  [ARIA-FLIP] audit query failed:", qErr.message);

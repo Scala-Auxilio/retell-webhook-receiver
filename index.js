@@ -9,7 +9,7 @@ const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGE
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
-const RETELL_WEBHOOK_SECRET = process.env.RETELL_WEBHOOK_SECRET || null;
+const RETELL_WEBHOOK_SECRET = null; // HOTFIX 2026-04-10: disabled until proper Retell SDK signature verification is implemented (see notes)
 
 // ─── Email Config (Resend HTTP API) ─────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;

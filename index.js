@@ -284,7 +284,18 @@ app.get("/health", async (_req, res) => {
 function mapAriaDisposition(callData, callAnalysis) {
   // ── Method 1: Post-Call Analysis (if enabled on the Retell agent) ──────────
   if (callAnalysis) {
-    const outcome = (callAnalysis.call_outcome || callAnalysis.outcome || "").toLowerCase().trim();
+    // Retell's user-defined custom analysis fields live under custom_analysis_data.
+    // The call_outcome / call_disposition fields we configured live there, NOT at the top level.
+    // We keep top-level fallbacks for legacy / alternative configurations.
+    const cad = callAnalysis.custom_analysis_data || {};
+    const outcome = (
+      cad.call_outcome ||
+      cad.call_disposition ||
+      cad.disposition ||
+      callAnalysis.call_outcome ||
+      callAnalysis.outcome ||
+      ""
+    ).toLowerCase().trim();
     // Direct match against our 13 dispositions
     const validDispositions = [
       "no_answer", "voicemail_left", "meeting_booked", "callback_requested",
@@ -744,20 +755,54 @@ app.post("/webhooks/retell", async (req, res) => {
     }
 
     // ─── Aria (Sendsteps) call-end → update Zoho CRM directly ──────────────
+    // IMPORTANT: Retell fires two separate webhooks per call: "call_ended" (no
+    // analysis yet) then "call_analyzed" (with LLM post-call analysis). If we
+    // process on call_ended for connected calls, call_analysis is always null
+    // and mapAriaDisposition falls through to no_analysis_fallback → Failed.
+    //
+    // We bifurcate:
+    //   • call_ended: ONLY process when Retell's disconnection reason means the
+    //     call never actually connected (no_answer / dial_failed / machine /
+    //     error_*). For these, call_analyzed will NOT fire, so we must act now.
+    //   • call_analyzed: process everything else (user_hangup, agent_hangup,
+    //     inactivity, etc.) — this is where the real disposition lives.
+    // The two branches are mutually exclusive by event_type, so no double-write.
     const ARIA_AGENT_IDS = [
       "agent_aa56b68b02f6de4ac5725a829b", // Aria EN
       "agent_e1e1f763101db5abe0df281891", // Aria NL
     ];
-    if (ARIA_AGENT_IDS.includes(agentId) && eventType === "call_ended") {
-      try {
-        await handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt);
-      } catch (ariaErr) {
-        console.error(`  [ARIA] Zoho CRM update failed:`, ariaErr.message);
-        await pool.query(
-          `INSERT INTO notifications (subject, body, priority, source, status, error)
-           VALUES ($1, $2, $3, 'aria_call_ended', 'failed', $4)`,
-          [`Aria Zoho update failed for call ${callId}`, ariaErr.message, "high", ariaErr.message]
-        ).catch(() => {});
+    if (ARIA_AGENT_IDS.includes(agentId)) {
+      const reason = (callData.disconnection_reason || "").toLowerCase();
+      const isNoConnection =
+        reason === "dial_no_answer" ||
+        reason === "no_answer" ||
+        reason === "dial_busy" ||
+        reason === "line_busy" ||
+        reason === "machine_detected" ||
+        reason === "voicemail_reach" ||
+        reason === "dial_failed" ||
+        reason === "unknown_error" ||
+        reason.startsWith("error_");
+
+      const shouldProcess =
+        (eventType === "call_ended" && isNoConnection) ||
+        (eventType === "call_analyzed");
+
+      if (eventType === "call_ended" && !isNoConnection) {
+        console.log(`  [ARIA] call_ended for connected call (${reason}) — waiting for call_analyzed`);
+      }
+
+      if (shouldProcess) {
+        try {
+          await handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt);
+        } catch (ariaErr) {
+          console.error(`  [ARIA] Zoho CRM update failed:`, ariaErr.message);
+          await pool.query(
+            `INSERT INTO notifications (subject, body, priority, source, status, error)
+             VALUES ($1, $2, $3, 'aria_call_ended', 'failed', $4)`,
+            [`Aria Zoho update failed for call ${callId}`, ariaErr.message, "high", ariaErr.message]
+          ).catch(() => {});
+        }
       }
     }
   } catch (err) {

@@ -440,6 +440,9 @@ const DISPOSITION_TO_ARIA_STATUS = {
   "internal_discussion":       "Completed - Internal Discussion",
   "transfer_succeeded":        "Completed - Transfer to Human",
   "transfer_failed_no_action": "Completed - Transfer Failed",
+  // mapAriaDisposition emits `callback_requested`. We keep `call_back_scheduled`
+  // as a legacy alias so older payloads continue to work.
+  "callback_requested":        "Call back Scheduled",
   "call_back_scheduled":       "Call back Scheduled",
   "existing_customer":         "Existing Customer",
   "referral_given":            "Completed - Referral Given",

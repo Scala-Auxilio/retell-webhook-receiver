@@ -299,9 +299,16 @@ function registerRoutes(app) {
    *   start_date - YYYY-MM-DD (optional, defaults to tomorrow)
    *   days       - number of days to look ahead (default: 5, max: 7)
    */
-  app.get("/calendly/availability", async (req, res) => {
+  const availabilityHandler = async (req, res) => {
     try {
-      const { specialist, language, start_date, days } = req.query;
+      // Accept params from query string (GET) or body (POST).
+      // Retell custom-function tools with args_at_root=false wrap args as { args: { ... } }.
+      // Defensive: also merge raw body so manual callers keep working.
+      const bodyArgs = (req.body && typeof req.body === "object" && req.body.args && typeof req.body.args === "object")
+        ? req.body.args
+        : (req.body && typeof req.body === "object" ? req.body : {});
+      const params = { ...req.query, ...bodyArgs };
+      const { specialist, language, start_date, days } = params;
 
       // Ensure event types are resolved
       await resolveEventTypes();
@@ -310,7 +317,7 @@ function registerRoutes(app) {
 
       if (!specKey) {
         // No specialist provided and no default — cannot route to a calendar
-        console.error(`[CALENDLY] No specialist provided. Query: ${JSON.stringify(req.query)}`);
+        console.error(`[CALENDLY] No specialist provided. Params: ${JSON.stringify(params)}`);
         return res.status(400).json({
           error: "Missing 'specialist' parameter. Must be one of: " + Object.keys(SPECIALISTS).join(", "),
           available: false,
@@ -353,7 +360,11 @@ function registerRoutes(app) {
     } catch (err) {
       console.error("[CALENDLY] Availability check failed:", err.message);
       // On error, fall back to email-based booking
-      const specKey = req.query.specialist || getDefaultSpecialist() || "rogier";
+      const fallbackBodyArgs = (req.body && typeof req.body === "object" && req.body.args && typeof req.body.args === "object")
+        ? req.body.args
+        : (req.body && typeof req.body === "object" ? req.body : {});
+      const fallbackParams = { ...req.query, ...fallbackBodyArgs };
+      const specKey = fallbackParams.specialist || getDefaultSpecialist() || "rogier";
       const spec = SPECIALISTS[specKey] || SPECIALISTS.rogier;
       res.json({
         available: false,
@@ -365,7 +376,12 @@ function registerRoutes(app) {
         error: err.message,
       });
     }
-  });
+  };
+
+  // Register both GET (current Retell tool config) and POST (defensive, for any
+  // future Retell behavior where custom-function tools POST regardless of method).
+  app.get("/calendly/availability", availabilityHandler);
+  app.post("/calendly/availability", availabilityHandler);
 
   /**
    * POST /calendly/book

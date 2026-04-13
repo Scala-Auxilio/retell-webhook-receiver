@@ -1465,9 +1465,17 @@ app.post("/zoho/echo", requireAuth, async (req, res) => {
 app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   const zohoLead = req.body;
 
-  // Temporary diagnostic: log raw keys so we can see how Zoho Flow names the lead ID
+  // Temporary diagnostic: capture raw Zoho Flow payload in DB for inspection
+  const idKeys = Object.keys(zohoLead).filter(k => /id/i.test(k));
   console.log(`  [ZOHO-DIAG] Raw payload keys: ${Object.keys(zohoLead).join(", ")}`);
-  console.log(`  [ZOHO-DIAG] ID-like values: ID=${zohoLead.ID} | id=${zohoLead.id} | Id=${zohoLead.Id} | lead_id=${zohoLead.lead_id} | Lead_Id=${zohoLead.Lead_Id} | Record_Id=${zohoLead.Record_Id} | record_id=${zohoLead.record_id}`);
+  console.log(`  [ZOHO-DIAG] ID-like keys: ${JSON.stringify(Object.fromEntries(idKeys.map(k => [k, zohoLead[k]])))}`);
+  try {
+    await pool.query(
+      `INSERT INTO notifications (subject, body, priority, source, status)
+       VALUES ($1, $2, 'low', 'zoho_diag', 'logged')`,
+      ['Zoho Flow raw payload', JSON.stringify({ keys: Object.keys(zohoLead), id_fields: Object.fromEntries(idKeys.map(k => [k, zohoLead[k]])), full: zohoLead })]
+    );
+  } catch (_) {}
 
   const ariaStatus = zohoLead.Aria_Status || zohoLead.aria_status;
 

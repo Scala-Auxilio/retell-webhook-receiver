@@ -1428,6 +1428,25 @@ app.get("/aria/binding-status", requireAuth, async (_req, res) => {
 });
 
 // ─── Zoho Flow → Aria Pipeline (triggered when Aria_Status changes) ─────────
+// ── Zoho OAuth diagnostic (temporary – remove after pilot stabilises) ──
+app.get("/zoho/status", requireAuth, async (_req, res) => {
+  try {
+    const token = await getZohoAccessToken();
+    const orgResp = await fetch(`${ZOHO_CRM_BASE}/org`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+    });
+    const orgData = await orgResp.json();
+    res.json({
+      oauth: "working",
+      token_preview: token.substring(0, 10) + "...",
+      org_test: orgResp.ok ? "connected" : "failed",
+      org_data: orgResp.ok ? { company_name: orgData.org?.[0]?.company_name } : orgData,
+    });
+  } catch (err) {
+    res.status(500).json({ oauth: "failed", error: err.message });
+  }
+});
+
 app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   const zohoLead = req.body;
   const ariaStatus = zohoLead.Aria_Status || zohoLead.aria_status;

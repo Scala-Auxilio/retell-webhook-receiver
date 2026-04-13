@@ -1608,6 +1608,97 @@ app.post("/zoho/aria-result", requireAuth, async (req, res) => {
 });
 
 // ─── EconoWind Leads query endpoint ─────────────────────────────────────────
+// ── Daily KPI Report endpoint ──────────────────────────────────────────────
+// Returns structured Aria call data for a given date (default: today).
+// Used by the Cowork scheduled task to populate the local KPI Excel tracker.
+app.get("/reports/daily-calls", requireAuth, async (req, res) => {
+  try {
+    const dateParam = req.query.date; // YYYY-MM-DD, defaults to today
+    const targetDate = dateParam || new Date().toISOString().split("T")[0];
+
+    // 1. Get all call_analyzed events for Aria agents on this date
+    const ariaAgentIds = [AGENTS.aria_en.agent_id, AGENTS.aria_nl.agent_id];
+    const eventsResult = await pool.query(
+      `SELECT call_id, agent_id, full_payload, call_analysis, received_at
+       FROM retell_events
+       WHERE event_type = 'call_analyzed'
+         AND agent_id = ANY($1)
+         AND received_at::date = $2::date
+       ORDER BY received_at ASC`,
+      [ariaAgentIds, targetDate]
+    );
+
+    // 2. Get processed results from notifications (has disposition, status, etc.)
+    const notifsResult = await pool.query(
+      `SELECT subject, body, sent_at
+       FROM notifications
+       WHERE source = 'aria_call_ended'
+         AND sent_at::date = $1::date
+       ORDER BY sent_at ASC`,
+      [targetDate]
+    );
+
+    // 3. Build a map of call_id -> processed result from notifications
+    const processedMap = {};
+    for (const n of notifsResult.rows) {
+      try {
+        const data = JSON.parse(n.body);
+        if (data.call_id) processedMap[data.call_id] = data;
+      } catch (_) {}
+    }
+
+    // 4. Merge into structured call records
+    const calls = eventsResult.rows.map(ev => {
+      const payload = typeof ev.full_payload === "string" ? JSON.parse(ev.full_payload) : ev.full_payload;
+      const callData = payload.call || {};
+      const dynVars = callData.retell_llm_dynamic_variables || {};
+      const analysis = typeof ev.call_analysis === "string" ? JSON.parse(ev.call_analysis) : ev.call_analysis;
+      const processed = processedMap[ev.call_id] || {};
+
+      const agentLabel = AGENT_ID_TO_LABEL[ev.agent_id] || ev.agent_id;
+      const language = agentLabel.includes("EN") ? "EN" : "NL";
+      const durationSec = Math.round((callData.duration_ms || 0) / 1000);
+      const disposition = processed.disposition || analysis?.call_disposition || "unknown";
+      const connected = !["no_answer", "voicemail", "voicemail_left", "wrong_number", "no_analysis_fallback"].includes(disposition);
+      const dmReached = ["interested", "not_interested", "callback_requested"].includes(disposition);
+      const meetingBooked = disposition === "interested" && (
+        (analysis?.meeting_booked || "").toLowerCase() === "yes" ||
+        (processed.aria_status || "").includes("Meeting Booked")
+      );
+
+      return {
+        date: targetDate,
+        time: new Date(ev.received_at).toISOString().split("T")[1].substring(0, 8),
+        agent: agentLabel.replace(" (Sendsteps)", ""),
+        language,
+        lead_id: processed.lead_id || dynVars.zoho_lead_id || null,
+        lead_name: processed.prospect_name || dynVars.prospect_first_name || dynVars.contact_name || "",
+        company: processed.university_name || dynVars.university_name || "",
+        email: processed.prospect_email || dynVars.prospect_email || "",
+        phone: dynVars.prospect_phone || "",
+        specialist: dynVars.specialist || "",
+        disposition,
+        duration_sec: durationSec,
+        connected: connected ? "Yes" : "No",
+        dm_reached: dmReached ? "Yes" : "No",
+        meeting_booked: meetingBooked ? "Yes" : "No",
+        attempt: processed.aria_status ? (processed.aria_status.match(/Attempt (\d)/) || [])[1] || "" : "",
+        aria_status_after: processed.aria_status || "",
+        notes: analysis?.call_summary || "",
+      };
+    });
+
+    res.json({
+      date: targetDate,
+      total_calls: calls.length,
+      calls,
+    });
+  } catch (err) {
+    console.error("[REPORT] daily-calls error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/econowind/leads", async (req, res) => {
   try {
     const { priority, since, limit = 50 } = req.query;
@@ -1646,6 +1737,7 @@ async function start() {
       console.log(`   GET  /stats               - Event statistics`);
       console.log(`   GET  /events              - Query stored events`);
       console.log(`   GET  /notifications       - Notification history`);
+      console.log(`   GET  /reports/daily-calls  - Daily KPI call data (JSON)`);
       console.log(`   GET  /econowind/leads     - EconoWind lead history`);
       console.log(`   POST /batch-call          - Dispatch Retell batch calls`);
       console.log(`   GET  /batch-call/agents   - Available batch call agents`);

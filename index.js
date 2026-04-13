@@ -1432,15 +1432,18 @@ app.get("/aria/binding-status", requireAuth, async (_req, res) => {
 app.get("/zoho/status", requireAuth, async (_req, res) => {
   try {
     const token = await getZohoAccessToken();
-    const orgResp = await fetch(`${ZOHO_CRM_BASE}/org`, {
+    // Test token against Leads (the actual module we need)
+    const leadsResp = await fetch(`${ZOHO_CRM_BASE}/Leads?fields=id,Full_Name,Aria_Status&per_page=1`, {
       headers: { Authorization: `Zoho-oauthtoken ${token}` },
     });
-    const orgData = await orgResp.json();
+    const leadsData = await leadsResp.json();
     res.json({
       oauth: "working",
       token_preview: token.substring(0, 10) + "...",
-      org_test: orgResp.ok ? "connected" : "failed",
-      org_data: orgResp.ok ? { company_name: orgData.org?.[0]?.company_name } : orgData,
+      leads_api: leadsResp.ok ? "connected" : "failed",
+      leads_test: leadsResp.ok
+        ? { count: leadsData.data?.length, sample: leadsData.data?.[0]?.Full_Name }
+        : leadsData,
     });
   } catch (err) {
     res.status(500).json({ oauth: "failed", error: err.message });

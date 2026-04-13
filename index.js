@@ -1485,6 +1485,41 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
 
   // Map Zoho lead to prospect format
   const prospect = mapZohoLead(zohoLead);
+
+  // ── Resolve missing fields from Zoho CRM (workaround: Zoho Flow cannot
+  //    send ${trigger.id}, ${trigger.Owner.email}, ${trigger.Owner.name}) ──
+  if (!prospect.zoho_lead_id && prospect.email) {
+    try {
+      const token = await getZohoAccessToken();
+      const headers = { Authorization: `Zoho-oauthtoken ${token}` };
+      const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=(Email:equals:${encodeURIComponent(prospect.email)})&fields=id,Owner,Full_Name`;
+      const searchRes = await fetch(searchUrl, { headers });
+      if (searchRes.ok) {
+        const searchData = await searchRes.json();
+        const lead = searchData?.data?.[0];
+        if (lead) {
+          prospect.zoho_lead_id = lead.id;
+          console.log(`  [ZOHO-RESOLVE] Resolved lead by email ${prospect.email} → id ${lead.id}`);
+
+          // Also patch Owner fields if missing
+          if (!prospect.lead_owner_email && lead.Owner?.email) {
+            prospect.lead_owner_email = lead.Owner.email;
+          }
+          if (!prospect.lead_owner_name && lead.Owner?.name) {
+            prospect.lead_owner_name = lead.Owner.name;
+          }
+        } else {
+          console.warn(`  [ZOHO-RESOLVE] No lead found for email ${prospect.email}`);
+        }
+      } else {
+        console.warn(`  [ZOHO-RESOLVE] Search failed (${searchRes.status})`);
+      }
+    } catch (resolveErr) {
+      console.error(`  [ZOHO-RESOLVE] Error resolving lead:`, resolveErr.message);
+      // Fail-open: continue dispatch even if resolution fails
+    }
+  }
+
   const agentKey = agentFromAriaStatus(ariaStatus);
 
   if (!agentKey) {

@@ -1450,8 +1450,25 @@ app.get("/zoho/status", requireAuth, async (_req, res) => {
   }
 });
 
+// Temporary: echo back whatever Zoho Flow sends so we can inspect the field names
+app.post("/zoho/echo", requireAuth, async (req, res) => {
+  const keys = Object.keys(req.body || {});
+  const idCandidates = keys.filter(k => /id/i.test(k));
+  res.json({
+    all_keys: keys,
+    id_candidates: idCandidates,
+    id_values: Object.fromEntries(idCandidates.map(k => [k, req.body[k]])),
+    full_body: req.body,
+  });
+});
+
 app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   const zohoLead = req.body;
+
+  // Temporary diagnostic: log raw keys so we can see how Zoho Flow names the lead ID
+  console.log(`  [ZOHO-DIAG] Raw payload keys: ${Object.keys(zohoLead).join(", ")}`);
+  console.log(`  [ZOHO-DIAG] ID-like values: ID=${zohoLead.ID} | id=${zohoLead.id} | Id=${zohoLead.Id} | lead_id=${zohoLead.lead_id} | Lead_Id=${zohoLead.Lead_Id} | Record_Id=${zohoLead.Record_Id} | record_id=${zohoLead.record_id}`);
+
   const ariaStatus = zohoLead.Aria_Status || zohoLead.aria_status;
 
   if (!ariaStatus) {

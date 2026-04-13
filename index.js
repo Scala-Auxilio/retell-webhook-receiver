@@ -1235,7 +1235,7 @@ app.post("/webhooks/econowind", requireAuth, async (req, res) => {
 });
 
 // ─── Calendly Integration (live booking for Retell agents) ──────────────────
-calendly.registerRoutes(app);
+calendly.registerRoutes(app, { sendEmail });
 
 // ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
 scorer.registerRoutes(app, pool);

@@ -285,7 +285,32 @@ async function createBooking(eventTypeUri, details) {
 
 // ─── Express route handlers ──────────────────────────────────────────────────
 
-function registerRoutes(app) {
+function registerRoutes(app, { sendEmail } = {}) {
+
+  // ── Fallback email helper: sends Calendly booking link to prospect ──
+  function sendFallbackEmail({ email, name, spec, language }) {
+    if (!sendEmail || !email) return;
+    const isNL = (language || "").toLowerCase().startsWith("nl");
+    const subject = isNL ? "Boek uw Sendsteps Demo" : "Book Your Sendsteps Demo";
+    const greeting = isNL ? `Beste ${name || ""}` : `Hi ${name || "there"}`;
+    const textBody = isNL
+      ? `${greeting},\n\nBedankt voor uw interesse in Sendsteps!\n\nGebruik de link hieronder om een demo van 20 minuten in te plannen op een moment dat u uitkomt:\n${spec.fallback_url}\n\nWe kijken ernaar uit!\n\nMet vriendelijke groet,\n${spec.name} - Sendsteps`
+      : `${greeting},\n\nThank you for your interest in Sendsteps!\n\nPlease use the link below to book a 20-minute demo at a time that works for you:\n${spec.fallback_url}\n\nLooking forward to connecting!\n\nBest regards,\n${spec.name} - Sendsteps`;
+    const htmlBody = isNL
+      ? `<p>${greeting},</p><p>Bedankt voor uw interesse in Sendsteps!</p><p>Gebruik de link hieronder om een demo van 20 minuten in te plannen op een moment dat u uitkomt:</p><p><a href="${spec.fallback_url}" style="display:inline-block;padding:12px 24px;background-color:#2A9D8F;color:white;text-decoration:none;border-radius:6px;">Boek uw Demo</a></p><p>Of kopieer deze link: ${spec.fallback_url}</p><p>We kijken ernaar uit!</p><p>Met vriendelijke groet,<br>${spec.name}<br>Sendsteps</p>`
+      : `<p>${greeting},</p><p>Thank you for your interest in Sendsteps!</p><p>Please use the link below to book a 20-minute demo at a time that works for you:</p><p><a href="${spec.fallback_url}" style="display:inline-block;padding:12px 24px;background-color:#2A9D8F;color:white;text-decoration:none;border-radius:6px;">Book Your Demo</a></p><p>Or copy this link: ${spec.fallback_url}</p><p>Looking forward to connecting!</p><p>Best regards,<br>${spec.name}<br>Sendsteps</p>`;
+
+    // Fire-and-forget so it doesn't block the Retell response
+    sendEmail({
+      from: process.env.NOTIFY_FROM || "aria@sendsteps.com",
+      to: email,
+      subject,
+      text: textBody,
+      html: htmlBody,
+    })
+      .then(() => console.log(`[CALENDLY] Fallback email sent to ${email} (${isNL ? "NL" : "EN"}) with ${spec.name}'s booking link`))
+      .catch(err => console.error(`[CALENDLY] Failed to send fallback email to ${email}:`, err.message));
+  }
 
   /**
    * GET /calendly/availability
@@ -433,13 +458,15 @@ function registerRoutes(app) {
       if (!spec || !spec.event_type_uri) {
         // Can't book without configured event type — return fallback
         const fallbackSpec = spec || SPECIALISTS.rogier;
-        return res.json({
+        res.json({
           booked: false,
           fallback: true,
           fallback_url: fallbackSpec.fallback_url,
           spoken: `I wasn't able to book that slot directly. I'll send you a calendar link by email instead.`,
           spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
         });
+        sendFallbackEmail({ email, name, spec: fallbackSpec, language });
+        return;
       }
 
       console.log(`[CALENDLY] Booking ${name} with ${spec.name} at ${start_time}...`);
@@ -481,6 +508,7 @@ function registerRoutes(app) {
         spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
         error: err.message,
       });
+      sendFallbackEmail({ email: _b.email, name: _b.name, spec, language: _b.language });
     }
   });
 

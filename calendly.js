@@ -301,8 +301,10 @@ function registerRoutes(app, { sendEmail } = {}) {
       : `<p>${greeting},</p><p>Thank you for your interest in Sendsteps!</p><p>Please use the link below to book a 20-minute demo at a time that works for you:</p><p><a href="${spec.fallback_url}" style="display:inline-block;padding:12px 24px;background-color:#2A9D8F;color:white;text-decoration:none;border-radius:6px;">Book Your Demo</a></p><p>Or copy this link: ${spec.fallback_url}</p><p>Looking forward to connecting!</p><p>Best regards,<br>${spec.name}<br>Sendsteps</p>`;
 
     // Fire-and-forget so it doesn't block the Retell response
+    // Uses CALENDLY_FROM_EMAIL so prospect-facing emails come from @sendsteps.com
+    // (separate from NOTIFY_FROM which is for internal notifications)
     sendEmail({
-      from: process.env.NOTIFY_FROM || "aria@sendsteps.com",
+      from: process.env.CALENDLY_FROM_EMAIL || "Aria at Sendsteps <aria@sendsteps.com>",
       to: email,
       subject,
       text: textBody,

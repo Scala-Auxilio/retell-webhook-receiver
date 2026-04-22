@@ -288,17 +288,44 @@ async function createBooking(eventTypeUri, details) {
 function registerRoutes(app, { sendEmail } = {}) {
 
   // ── Fallback email helper: sends Calendly booking link to prospect ──
-  function sendFallbackEmail({ email, name, spec, language }) {
+  function sendFallbackEmail({ email, name, spec, language, start_time, timezone }) {
     if (!sendEmail || !email) return;
     const isNL = (language || "").toLowerCase().startsWith("nl");
-    const subject = isNL ? "Boek uw Sendsteps Demo" : "Book Your Sendsteps Demo";
+    const tz = timezone || "Europe/Amsterdam";
+
+    // Build a human-readable "Thursday 23 April at 10:00 AM" string if we have a time
+    let whenEN = null, whenNL = null;
+    if (start_time) {
+      try {
+        const dt = new Date(start_time);
+        whenEN = `${dt.toLocaleDateString("en-GB", { weekday: "long", month: "long", day: "numeric", timeZone: tz })} at ${dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hourCycle: "h12", timeZone: tz })}`;
+        whenNL = `${dt.toLocaleDateString("nl-NL", { weekday: "long", month: "long", day: "numeric", timeZone: tz })} om ${dt.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit", timeZone: tz })}`;
+      } catch (_) { /* ignore formatting errors */ }
+    }
+
+    const subject = isNL
+      ? (whenNL ? `Bevestig uw Sendsteps demo — ${whenNL}` : "Boek uw Sendsteps Demo")
+      : (whenEN ? `Confirm your Sendsteps demo — ${whenEN}` : "Book Your Sendsteps Demo");
     const greeting = isNL ? `Beste ${name || ""}` : `Hi ${name || "there"}`;
+
+    // Prefill the Calendly URL with name/email so the prospect only has to click "Confirm"
+    const params = new URLSearchParams();
+    if (name) params.set("name", name);
+    if (email) params.set("email", email);
+    const sep = spec.fallback_url.includes("?") ? "&" : "?";
+    const prefillUrl = `${spec.fallback_url}${sep}${params.toString()}`;
+
+    const timePhraseEN = whenEN ? ` for your ${whenEN} slot` : "";
+    const timePhraseNL = whenNL ? ` voor uw tijdslot van ${whenNL}` : "";
+
     const textBody = isNL
-      ? `${greeting},\n\nBedankt voor uw interesse in Sendsteps!\n\nGebruik de link hieronder om een demo van 20 minuten in te plannen op een moment dat u uitkomt:\n${spec.fallback_url}\n\nWe kijken ernaar uit!\n\nMet vriendelijke groet,\n${spec.name} - Sendsteps`
-      : `${greeting},\n\nThank you for your interest in Sendsteps!\n\nPlease use the link below to book a 20-minute demo at a time that works for you:\n${spec.fallback_url}\n\nLooking forward to connecting!\n\nBest regards,\n${spec.name} - Sendsteps`;
+      ? `${greeting},\n\nBedankt voor uw interesse in Sendsteps! Klik op de onderstaande link om uw demo${timePhraseNL} met ${spec.name} te bevestigen:\n${prefillUrl}\n\nAls deze tijd toch niet schikt kunt u via dezelfde link een ander moment kiezen.\n\nTot binnenkort!\n\nMet vriendelijke groet,\n${spec.name}\nSendsteps`
+      : `${greeting},\n\nThanks for your interest in Sendsteps! Click the link below to confirm your 20-minute demo${timePhraseEN} with ${spec.name}:\n${prefillUrl}\n\nIf that time no longer works, you can pick another slot on the same page.\n\nLooking forward to it!\n\nBest,\n${spec.name}\nSendsteps`;
+    const ctaEN = whenEN ? `Confirm ${whenEN}` : "Book Your Demo";
+    const ctaNL = whenNL ? `Bevestig ${whenNL}` : "Boek uw Demo";
     const htmlBody = isNL
-      ? `<p>${greeting},</p><p>Bedankt voor uw interesse in Sendsteps!</p><p>Gebruik de link hieronder om een demo van 20 minuten in te plannen op een moment dat u uitkomt:</p><p><a href="${spec.fallback_url}" style="display:inline-block;padding:12px 24px;background-color:#2A9D8F;color:white;text-decoration:none;border-radius:6px;">Boek uw Demo</a></p><p>Of kopieer deze link: ${spec.fallback_url}</p><p>We kijken ernaar uit!</p><p>Met vriendelijke groet,<br>${spec.name}<br>Sendsteps</p>`
-      : `<p>${greeting},</p><p>Thank you for your interest in Sendsteps!</p><p>Please use the link below to book a 20-minute demo at a time that works for you:</p><p><a href="${spec.fallback_url}" style="display:inline-block;padding:12px 24px;background-color:#2A9D8F;color:white;text-decoration:none;border-radius:6px;">Book Your Demo</a></p><p>Or copy this link: ${spec.fallback_url}</p><p>Looking forward to connecting!</p><p>Best regards,<br>${spec.name}<br>Sendsteps</p>`;
+      ? `<p>${greeting},</p><p>Bedankt voor uw interesse in Sendsteps! Klik op de knop hieronder om uw demo${timePhraseNL} met ${spec.name} te bevestigen:</p><p><a href="${prefillUrl}" style="display:inline-block;padding:12px 24px;background-color:#2A9D8F;color:white;text-decoration:none;border-radius:6px;">${ctaNL}</a></p><p>Als deze tijd toch niet schikt kunt u via dezelfde link een ander moment kiezen.</p><p>Of kopieer deze link: ${prefillUrl}</p><p>Tot binnenkort!</p><p>Met vriendelijke groet,<br>${spec.name}<br>Sendsteps</p>`
+      : `<p>${greeting},</p><p>Thanks for your interest in Sendsteps! Click the button below to confirm your 20-minute demo${timePhraseEN} with ${spec.name}:</p><p><a href="${prefillUrl}" style="display:inline-block;padding:12px 24px;background-color:#2A9D8F;color:white;text-decoration:none;border-radius:6px;">${ctaEN}</a></p><p>If that time no longer works, you can pick another slot on the same page.</p><p>Or copy this link: ${prefillUrl}</p><p>Looking forward to it!</p><p>Best,<br>${spec.name}<br>Sendsteps</p>`;
 
     // Fire-and-forget so it doesn't block the Retell response
     // Uses CALENDLY_FROM_EMAIL so prospect-facing emails come from @sendsteps.com
@@ -450,24 +477,24 @@ function registerRoutes(app, { sendEmail } = {}) {
         return res.status(400).json({
           error: "Missing 'specialist' parameter. Must be one of: " + Object.keys(SPECIALISTS).join(", "),
           booked: false,
-          spoken: `I wasn't able to book that slot directly. I'll send you a calendar link by email instead.`,
-          spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
+          spoken: `Perfect. I'll send the confirmation link to your email right now so you can pick your time and finalise the booking.`,
+          spoken_nl: `Perfect. Ik stuur de bevestigingslink naar uw e-mail zodat u uw tijd kunt kiezen en de boeking kunt bevestigen.`,
         });
       }
 
       const spec = SPECIALISTS[specKey];
 
       if (!spec || !spec.event_type_uri) {
-        // Can't book without configured event type — return fallback
+        // Can't book without configured event type — send a personalised booking link instead
         const fallbackSpec = spec || SPECIALISTS.rogier;
         res.json({
           booked: false,
           fallback: true,
           fallback_url: fallbackSpec.fallback_url,
-          spoken: `I wasn't able to book that slot directly. I'll send you a calendar link by email instead.`,
-          spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
+          spoken: `Perfect. I'll send the confirmation link to ${email} right now so you can lock in your slot with ${fallbackSpec.name}. Just click the button in the email and you're all set.`,
+          spoken_nl: `Perfect. Ik stuur de bevestigingslink naar ${email} zodat u uw tijdslot met ${fallbackSpec.name} kunt vastleggen. Klik op de knop in de e-mail en het is geregeld.`,
         });
-        sendFallbackEmail({ email, name, spec: fallbackSpec, language });
+        sendFallbackEmail({ email, name, spec: fallbackSpec, language, start_time, timezone });
         return;
       }
 
@@ -502,15 +529,16 @@ function registerRoutes(app, { sendEmail } = {}) {
       const _b = (req.body && req.body.args && typeof req.body.args === "object") ? req.body.args : (req.body || {});
       const specKey = _b.specialist || getDefaultSpecialist() || "rogier";
       const spec = SPECIALISTS[specKey] || SPECIALISTS.rogier;
+      const displayEmail = _b.email || "your email";
       res.json({
         booked: false,
         fallback: true,
         fallback_url: spec.fallback_url,
-        spoken: `I wasn't able to book that slot directly. I'll send you a calendar link by email instead.`,
-        spoken_nl: `Het is mij niet gelukt om dat tijdslot direct te boeken. Ik stuur u een agenda-link per e-mail.`,
+        spoken: `Perfect. I'll send the confirmation link to ${displayEmail} right now so you can lock in your slot with ${spec.name}. Just click the button in the email and you're all set.`,
+        spoken_nl: `Perfect. Ik stuur de bevestigingslink naar ${displayEmail} zodat u uw tijdslot met ${spec.name} kunt vastleggen. Klik op de knop in de e-mail en het is geregeld.`,
         error: err.message,
       });
-      sendFallbackEmail({ email: _b.email, name: _b.name, spec, language: _b.language });
+      sendFallbackEmail({ email: _b.email, name: _b.name, spec, language: _b.language, start_time: _b.start_time, timezone: _b.timezone });
     }
   });
 

@@ -594,7 +594,21 @@ async function fetchAttemptCount(zohoLeadId, prospectEmail) {
  */
 async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
   const dynVars = callData.retell_llm_dynamic_variables || {};
-  const zohoLeadId = dynVars.zoho_lead_id || null;
+  // Zoho CRM lead IDs are numeric long integers. If dynVars.zoho_lead_id is
+  // present but non-numeric (e.g. ad-hoc test calls dialed directly via the
+  // Retell API without a real Zoho lead behind them), treat it as missing —
+  // otherwise Zoho rejects the update with INVALID_DATA and we spam the
+  // notifications inbox with false-positive "Aria Zoho update failed" alerts.
+  const zohoLeadId = (() => {
+    const raw = dynVars.zoho_lead_id;
+    if (raw === undefined || raw === null || raw === "") return null;
+    const str = String(raw).trim();
+    if (!/^\d+$/.test(str)) {
+      console.warn(`  [ARIA] Ignoring non-numeric zoho_lead_id='${str}' — treating as missing (likely ad-hoc test call)`);
+      return null;
+    }
+    return str;
+  })();
   const prospectName = dynVars.prospect_first_name || dynVars.contact_name || "";
   const universityName = dynVars.university_name || "";
 

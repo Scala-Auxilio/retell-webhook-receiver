@@ -1520,10 +1520,22 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
     }
   }
 
-  const agentKey = agentFromAriaStatus(ariaStatus);
+  let agentKey = agentFromAriaStatus(ariaStatus);
 
   if (!agentKey) {
     return res.status(400).json({ error: `Cannot determine agent from Aria_Status: '${ariaStatus}'. Expected 'Ready for Aria EN' or 'Ready for Aria NL'.` });
+  }
+
+  // UK country override: if the lead is an EN lead AND the prospect's country
+  // is UK/GB, promote to aria_en_uk so we call from the UK DID (+447863759619).
+  // Must run BEFORE the ARIA_FLIP_MODE block — flip mode applies only to the
+  // shared NL DID, not to the dedicated UK trunk.
+  if (agentKey === "aria_en" && prospect.country) {
+    const c = String(prospect.country).trim().toLowerCase();
+    if (c === "uk" || c === "gb" || c === "united kingdom" || c === "great britain") {
+      agentKey = "aria_en_uk";
+      console.log(`  [ROUTING] UK prospect detected (country='${prospect.country}') — promoted aria_en → aria_en_uk`);
+    }
   }
 
   // Aria flip-mode guard: refuse dispatch if the shared NL DID is currently

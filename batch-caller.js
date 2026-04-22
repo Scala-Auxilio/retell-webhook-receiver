@@ -27,6 +27,11 @@ const AGENTS = {
     label: "Aria EN (Sendsteps)",
     from_number: process.env.ARIA_EN_FROM_NUMBER || null, // Set in env, e.g. +312071636XX
   },
+  aria_en_uk: {
+    agent_id: "agent_aa56b68b02f6de4ac5725a829b",
+    label: "Aria EN UK (Sendsteps)",
+    from_number: process.env.ARIA_EN_UK_FROM_NUMBER || null, // UK DID: +447863759619
+  },
   aria_nl: {
     agent_id: "agent_e1e1f763101db5abe0df281891",
     label: "Aria NL (Sendsteps)",

@@ -34,6 +34,13 @@ const SPECIALISTS = {
     event_type_uri: process.env.CALENDLY_EVENT_TYPE_MIKE || null,
     fallback_url: process.env.CALENDLY_FALLBACK_URL_MIKE || "https://calendly.com/mike-coumans-sendsteps",
   },
+  // Pete handles UK university prospects directly (not Rogier/Mike).
+  // Uses Petrus Coelewij's "30 Minute Meeting" event type.
+  pete: {
+    name: "Pete",
+    event_type_uri: process.env.CALENDLY_EVENT_TYPE_PETE || null,
+    fallback_url: process.env.CALENDLY_FALLBACK_URL_PETE || "https://calendly.com/petrus-coelewij-sendsteps/30min",
+  },
 };
 
 // Cache for resolved event type URIs (populated on first request or startup)
@@ -99,11 +106,17 @@ async function resolveEventTypes() {
   }
 
   // Try to auto-match specialists by name if env vars not set
+  // Each specialist has its own matching hints because the "30 Minute Meeting"
+  // event type for Pete doesn't contain "pete" in the name or slug.
+  const MATCH_HINTS = {
+    rogier: (et) => et.name.toLowerCase().includes("rogier") || et.slug.toLowerCase().includes("rogier") || (et.scheduling_url || "").includes("rogier-smulders"),
+    mike:   (et) => et.name.toLowerCase().includes("mike")   || et.slug.toLowerCase().includes("mike")   || (et.scheduling_url || "").includes("mike-coumans"),
+    pete:   (et) => (et.scheduling_url || "").includes("petrus-coelewij") && et.slug === "30min",
+  };
   for (const [key, spec] of Object.entries(SPECIALISTS)) {
     if (!spec.event_type_uri) {
-      const match = Object.values(_eventTypeCache).find(
-        (et) => et.name.toLowerCase().includes(key) || et.slug.toLowerCase().includes(key)
-      );
+      const matcher = MATCH_HINTS[key] || ((et) => et.slug.toLowerCase().includes(key));
+      const match = Object.values(_eventTypeCache).find(matcher);
       if (match) {
         spec.event_type_uri = match.uri;
         console.log(`[CALENDLY] Auto-matched ${key} → ${match.name} (${match.uri})`);

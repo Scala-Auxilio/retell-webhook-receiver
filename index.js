@@ -1548,7 +1548,12 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
     const c = String(prospect.country).trim().toLowerCase();
     if (c === "uk" || c === "gb" || c === "united kingdom" || c === "great britain") {
       agentKey = "aria_en_uk";
-      console.log(`  [ROUTING] UK prospect detected (country='${prospect.country}') — promoted aria_en → aria_en_uk`);
+      // UK prospects book directly with Pete (Petrus), not Rogier or Mike.
+      // Override both specialist key (used by /calendly/book) and lead_owner_name
+      // (displayed to Aria as {{lead_owner_name}} in the prompt).
+      prospect.specialist = "pete";
+      prospect.lead_owner_name = "Pete";
+      console.log(`  [ROUTING] UK prospect detected (country='${prospect.country}') — promoted aria_en → aria_en_uk, specialist → pete`);
     }
   }
 

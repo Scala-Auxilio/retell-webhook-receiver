@@ -55,15 +55,18 @@ const CALLING_WINDOW = {
 // Maps Zoho CRM Lead Owner to Calendly specialist key.
 // Owner field from Zoho is a JSON object: { name, id, email }
 // Known owners:
-//   Rogier Smulders       (rogier.smulders@sendsteps.com) → "rogier"
-//   Mike Coumans l Sendsteps (mike.coumans@sendsteps.com) → "mike"
+//   Rogier Smulders          (rogier.smulders@sendsteps.com)   → "rogier" (NL)
+//   Mike Coumans l Sendsteps (mike.coumans@sendsteps.com)      → "mike"   (NL)
+//   Petrus Coelewij          (petrus.coelewij@sendsteps.com)   → "pete"   (UK leads)
 const OWNER_TO_SPECIALIST = {
   // Match by Zoho user ID (most reliable, never changes)
   "437076000003563557": "rogier",   // Rogier Smulders
   "437076000003563509": "mike",     // Mike Coumans
+  "437076000388674001": "pete",     // Petrus Coelewij (UK)
   // Match by email (fallback)
   "rogier.smulders@sendsteps.com": "rogier",
   "mike.coumans@sendsteps.com": "mike",
+  "petrus.coelewij@sendsteps.com": "pete",
 };
 
 function mapOwnerToSpecialist(ownerObj) {
@@ -82,6 +85,7 @@ function mapOwnerToSpecialist(ownerObj) {
   const name = (ownerObj.name || "").toLowerCase();
   if (name.includes("rogier")) return "rogier";
   if (name.includes("mike")) return "mike";
+  if (name.includes("petrus") || name.includes("pete") || name.includes("coelewij")) return "pete";
 
   // Unknown owner — log warning, return null (caller decides fallback)
   console.warn(`[OWNER] Unknown lead owner: ${JSON.stringify(ownerObj)} — cannot map to specialist`);

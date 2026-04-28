@@ -35,9 +35,11 @@ const SPECIALISTS = {
     fallback_url: process.env.CALENDLY_FALLBACK_URL_MIKE || "https://calendly.com/mike-coumans-sendsteps",
   },
   // Pete handles UK university prospects directly (not Rogier/Mike).
-  // Uses Petrus Coelewij's "30 Minute Meeting" event type.
+  // Uses Petrus Coelewij's "Sendsteps in Action" event type. Display name is
+  // "Petrus" because that's how the pre-call email is signed and how UK academic
+  // prospects expect first-contact formality.
   pete: {
-    name: "Pete",
+    name: "Petrus",
     event_type_uri: process.env.CALENDLY_EVENT_TYPE_PETE || null,
     fallback_url: process.env.CALENDLY_FALLBACK_URL_PETE || "https://calendly.com/petrus-coelewij-sendsteps/30min",
   },

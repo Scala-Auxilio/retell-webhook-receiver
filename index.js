@@ -1,5 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
+const cron = require("node-cron");
 const { Pool } = require("pg");
 const calendly = require("./calendly");
 const scorer = require("./interaction-scorer");
@@ -562,6 +563,123 @@ const ATTEMPT_STATUS_MAP = {
   2: "Attempt 2 - No Answer",
   3: "Attempt 3 - No Answer",
 };
+
+// Statuses that mean "this lead is parked, awaiting a future retry."
+// The retry tick rescues leads in any of these states whose Aria_Next_Retry_Date has arrived.
+const RETRY_PENDING_STATUSES = [
+  "Attempt 1 - No Answer",
+  "Attempt 2 - No Answer",
+  "Attempt 3 - No Answer",
+];
+
+// Status to flip eligible leads to. Must match a value the Zoho Flow trigger
+// listens for to fire /zoho/aria-trigger. "Retry Aria EN" is the canonical
+// retry-trigger value distinct from the initial "Ready for Aria EN".
+const RETRY_TARGET_STATUS = "Retry Aria EN";
+
+/**
+ * Scan Zoho for leads whose retry date has arrived and flip them back into
+ * the active dial queue. Idempotent: re-running on the same day is a no-op
+ * because the first flip moves them out of the RETRY_PENDING_STATUSES set.
+ *
+ * @param {Object} opts
+ * @param {boolean} opts.dryRun - if true, return the candidate set without flipping
+ * @returns {Object} { ok, today, count, flipped, errors, leads: [...] }
+ */
+async function runRetryTick({ dryRun = false } = {}) {
+  if (!ZOHO_REFRESH_TOKEN) {
+    throw new Error("Zoho CRM not configured (ZOHO_REFRESH_TOKEN missing) — cannot run retry tick");
+  }
+  const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+  const token = await getZohoAccessToken();
+  const headers = {
+    Authorization: `Zoho-oauthtoken ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  // 1. COQL query — leads due for retry today or earlier, still under attempt cap
+  const statusList = RETRY_PENDING_STATUSES.map(s => `'${s}'`).join(", ");
+  const coqlQuery =
+    `select id, First_Name, Last_Name, Aria_Status, Aria_Attempt_Count, ` +
+    `Aria_Next_Retry_Date, Country, Educational_Institute ` +
+    `from Leads ` +
+    `where Aria_Status in (${statusList}) ` +
+    `and Aria_Next_Retry_Date is not null ` +
+    `and Aria_Next_Retry_Date <= '${today}' ` +
+    `and Aria_Attempt_Count < 3 ` +
+    `limit 200`;
+
+  const queryRes = await fetch(`${ZOHO_CRM_BASE}/coql`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ select_query: coqlQuery }),
+  });
+  if (!queryRes.ok) {
+    const errText = await queryRes.text().catch(() => "");
+    throw new Error(`COQL query failed (${queryRes.status}): ${errText}`);
+  }
+  // 204 No Content = no matching leads
+  const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
+  const dueLeads = queryData?.data || [];
+
+  console.log(`[RETRY-TICK] today=${today} found=${dueLeads.length} dryRun=${dryRun}`);
+
+  const summarize = (lead, status) => ({
+    id: lead.id,
+    name: `${lead.First_Name || ""} ${lead.Last_Name || ""}`.trim(),
+    attempt: lead.Aria_Attempt_Count,
+    due: lead.Aria_Next_Retry_Date,
+    country: lead.Country || null,
+    institute: lead.Educational_Institute || null,
+    status: status || lead.Aria_Status,
+  });
+
+  if (dryRun || dueLeads.length === 0) {
+    return {
+      ok: true,
+      dryRun,
+      today,
+      count: dueLeads.length,
+      flipped: 0,
+      errors: 0,
+      leads: dueLeads.map(l => summarize(l)),
+    };
+  }
+
+  // 2. Flip each in batches of 100 (Zoho PUT /Leads cap)
+  const updates = dueLeads.map(l => ({ id: l.id, Aria_Status: RETRY_TARGET_STATUS }));
+  const results = [];
+  for (let i = 0; i < updates.length; i += 100) {
+    const batch = updates.slice(i, i + 100);
+    const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ data: batch }),
+    });
+    const updateData = await updateRes.json().catch(() => ({}));
+    results.push(...(updateData?.data || []));
+  }
+
+  const flipped = results.filter(r => r?.status === "success").length;
+  const errors = results.length - flipped;
+  console.log(`[RETRY-TICK] flipped=${flipped}/${results.length} target='${RETRY_TARGET_STATUS}' errors=${errors}`);
+
+  // Log per-lead detail (one line each — keeps Railway logs grep-friendly)
+  dueLeads.forEach((l, idx) => {
+    const r = results[idx];
+    console.log(`[RETRY-TICK]   lead=${l.id} ${l.First_Name || ""} ${l.Last_Name || ""} attempt=${l.Aria_Attempt_Count} due=${l.Aria_Next_Retry_Date} → ${r?.status || "unknown"}${r?.message ? " " + r.message : ""}`);
+  });
+
+  return {
+    ok: errors === 0,
+    dryRun: false,
+    today,
+    count: dueLeads.length,
+    flipped,
+    errors,
+    leads: dueLeads.map((l, idx) => summarize(l, results[idx]?.status === "success" ? RETRY_TARGET_STATUS : `error: ${results[idx]?.message || "unknown"}`)),
+  };
+}
 
 /**
  * Fetch a lead's current Aria_Attempt_Count from Zoho CRM.
@@ -1411,6 +1529,27 @@ app.post("/aria/set-agent", requireAuth, async (req, res) => {
   }
 });
 
+// POST /aria/retry-tick
+//   Scan Zoho for leads whose Aria_Next_Retry_Date has arrived and flip them
+//   back to "Retry Aria EN" so the existing Zoho Flow re-triggers Aria.
+//
+//   Auth: x-notify-secret header (or `secret` in body).
+//   Query params:
+//     ?dry_run=1   - return matches without flipping (safe to call repeatedly)
+//
+//   This endpoint is also invoked automatically by a daily cron at 09:00
+//   Europe/London (see start() below).
+app.post("/aria/retry-tick", requireAuth, async (req, res) => {
+  try {
+    const dryRun = req.query.dry_run === "1" || req.body?.dry_run === true;
+    const result = await runRetryTick({ dryRun });
+    res.json(result);
+  } catch (err) {
+    console.error("[RETRY-TICK] Error:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // GET /aria/binding-status
 //   Read-only. Returns the current Retell binding + most recent audit row.
 app.get("/aria/binding-status", requireAuth, async (_req, res) => {
@@ -1757,10 +1896,43 @@ app.get("/econowind/leads", async (req, res) => {
   }
 });
 
+// ─── Daily retry tick scheduler ──────────────────────────────────────────────
+// Runs runRetryTick() automatically at 09:00 Europe/London every day. The
+// 09:00 slot lines up with the prospect's working morning and gives Aria a
+// full business day to redial. Cron can be disabled by setting
+// ARIA_RETRY_CRON=off (e.g. when running multi-replica — only one replica
+// should hold the cron).
+function scheduleRetryTickCron() {
+  if (process.env.ARIA_RETRY_CRON === "off") {
+    console.log("[CRON] Aria retry tick DISABLED via ARIA_RETRY_CRON=off");
+    return;
+  }
+  if (!ZOHO_REFRESH_TOKEN) {
+    console.warn("[CRON] Aria retry tick NOT scheduled — Zoho not configured");
+    return;
+  }
+  cron.schedule(
+    "0 9 * * *",
+    async () => {
+      const startedAt = new Date().toISOString();
+      console.log(`[CRON] Running Aria retry tick (started ${startedAt})`);
+      try {
+        const result = await runRetryTick();
+        console.log(`[CRON] Retry tick complete: count=${result.count} flipped=${result.flipped} errors=${result.errors}`);
+      } catch (err) {
+        console.error("[CRON] Retry tick failed:", err.message);
+      }
+    },
+    { timezone: "Europe/London" }
+  );
+  console.log("[CRON] Aria retry tick scheduled — daily at 09:00 Europe/London");
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 async function start() {
   try {
     await initDatabase();
+    scheduleRetryTickCron();
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Retell Webhook Receiver v1.7.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);
@@ -1776,6 +1948,7 @@ async function start() {
       console.log(`   GET  /batch-call/agents   - Available batch call agents`);
       console.log(`   POST /zoho/aria-trigger   - Zoho Flow → Aria call pipeline`);
       console.log(`   POST /zoho/aria-result    - Call result callback for Zoho`);
+      console.log(`   POST /aria/retry-tick     - Flip due retries to 'Retry Aria EN' (auto-runs daily 09:00 London)`);
       console.log(`   GET  /calendly/availability - Calendly slot check (Retell custom fn)`);
       console.log(`   POST /calendly/book        - Calendly booking create (Retell custom fn)`);
       console.log(`   GET  /calendly/status       - Calendly integration health check`);

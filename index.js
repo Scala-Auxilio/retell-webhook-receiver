@@ -600,12 +600,15 @@ async function runRetryTick({ dryRun = false } = {}) {
   // 1. Search Zoho — leads due for retry today or earlier, still under attempt cap.
   // We use /Leads/search (criteria API) instead of COQL because the org's
   // refresh token doesn't carry the ZohoCRM.coql.READ scope.
+  // Zoho date fields don't support `less_equal`; we use `before:<tomorrow>`
+  // which is functionally `<= today`.
+  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split("T")[0];
   const statusGroup = RETRY_PENDING_STATUSES
     .map(s => `(Aria_Status:equals:${s})`)
     .join("or");
   const criteria =
     `(${statusGroup})` +
-    `and(Aria_Next_Retry_Date:less_equal:${today})` +
+    `and(Aria_Next_Retry_Date:before:${tomorrow})` +
     `and(Aria_Attempt_Count:less_than:3)`;
   const fields = "id,First_Name,Last_Name,Aria_Status,Aria_Attempt_Count,Aria_Next_Retry_Date,Country,Educational_Institute";
   const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;

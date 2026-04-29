@@ -604,10 +604,14 @@ async function runRetryTick({ dryRun = false } = {}) {
   // (tested: less_equal, before — both 400 with "invalid operator found").
   // So we filter the date in JS after the fetch. Volume is bounded (max
   // ~hundreds of pending retries), so the in-memory filter is fine.
+  // Zoho's criteria search is finicky about operators — even less_than on
+  // number fields gets rejected. We filter the candidate set down to the
+  // status-pending leads server-side, and apply the date + attempt-cap
+  // filters in JS below.
   const statusGroup = RETRY_PENDING_STATUSES
     .map(s => `(Aria_Status:equals:${s})`)
     .join("or");
-  const criteria = `(${statusGroup})and(Aria_Attempt_Count:less_than:3)`;
+  const criteria = `(${statusGroup})`;
   const fields = "id,First_Name,Last_Name,Aria_Status,Aria_Attempt_Count,Aria_Next_Retry_Date,Country,Educational_Institute";
   const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
 
@@ -620,15 +624,18 @@ async function runRetryTick({ dryRun = false } = {}) {
   const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
   const allCandidates = queryData?.data || [];
 
-  // In-memory date filter: only leads whose retry date has actually arrived.
-  // Lead with null retry date is skipped (shouldn't normally happen — the
-  // no-answer flow always sets one — but guard anyway).
+  // In-memory filters: date due AND attempt cap not exceeded.
+  // - Skip leads with null retry date (shouldn't normally happen but guard anyway)
+  // - Skip leads at or above 3 attempts (those should have been moved to
+  //   "Max Attempts - Nurture" by the no-answer flow but guard in case of drift)
   const dueLeads = allCandidates.filter(l => {
     if (!l.Aria_Next_Retry_Date) return false;
+    if ((l.Aria_Attempt_Count || 0) >= 3) return false;
     return l.Aria_Next_Retry_Date <= today; // YYYY-MM-DD lex comparison is correct
   });
-  if (allCandidates.length > dueLeads.length) {
-    console.log(`[RETRY-TICK] candidates=${allCandidates.length} due=${dueLeads.length} (${allCandidates.length - dueLeads.length} not yet due)`);
+  const filteredOut = allCandidates.length - dueLeads.length;
+  if (filteredOut > 0) {
+    console.log(`[RETRY-TICK] candidates=${allCandidates.length} due=${dueLeads.length} (${filteredOut} skipped: not yet due or >=3 attempts)`);
   }
 
   console.log(`[RETRY-TICK] today=${today} found=${dueLeads.length} dryRun=${dryRun}`);

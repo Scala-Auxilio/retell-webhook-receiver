@@ -597,26 +597,23 @@ async function runRetryTick({ dryRun = false } = {}) {
     "Content-Type": "application/json",
   };
 
-  // 1. COQL query — leads due for retry today or earlier, still under attempt cap
-  const statusList = RETRY_PENDING_STATUSES.map(s => `'${s}'`).join(", ");
-  const coqlQuery =
-    `select id, First_Name, Last_Name, Aria_Status, Aria_Attempt_Count, ` +
-    `Aria_Next_Retry_Date, Country, Educational_Institute ` +
-    `from Leads ` +
-    `where Aria_Status in (${statusList}) ` +
-    `and Aria_Next_Retry_Date is not null ` +
-    `and Aria_Next_Retry_Date <= '${today}' ` +
-    `and Aria_Attempt_Count < 3 ` +
-    `limit 200`;
+  // 1. Search Zoho — leads due for retry today or earlier, still under attempt cap.
+  // We use /Leads/search (criteria API) instead of COQL because the org's
+  // refresh token doesn't carry the ZohoCRM.coql.READ scope.
+  const statusGroup = RETRY_PENDING_STATUSES
+    .map(s => `(Aria_Status:equals:${s})`)
+    .join("or");
+  const criteria =
+    `(${statusGroup})` +
+    `and(Aria_Next_Retry_Date:less_equal:${today})` +
+    `and(Aria_Attempt_Count:less_than:3)`;
+  const fields = "id,First_Name,Last_Name,Aria_Status,Aria_Attempt_Count,Aria_Next_Retry_Date,Country,Educational_Institute";
+  const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
 
-  const queryRes = await fetch(`${ZOHO_CRM_BASE}/coql`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ select_query: coqlQuery }),
-  });
-  if (!queryRes.ok) {
+  const queryRes = await fetch(searchUrl, { headers });
+  if (!queryRes.ok && queryRes.status !== 204) {
     const errText = await queryRes.text().catch(() => "");
-    throw new Error(`COQL query failed (${queryRes.status}): ${errText}`);
+    throw new Error(`Lead search failed (${queryRes.status}): ${errText}`);
   }
   // 204 No Content = no matching leads
   const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();

@@ -597,19 +597,17 @@ async function runRetryTick({ dryRun = false } = {}) {
     "Content-Type": "application/json",
   };
 
-  // 1. Search Zoho — leads due for retry today or earlier, still under attempt cap.
+  // 1. Search Zoho — leads in any "Attempt N - No Answer" state, still under attempt cap.
   // We use /Leads/search (criteria API) instead of COQL because the org's
-  // refresh token doesn't carry the ZohoCRM.coql.READ scope.
-  // Zoho date fields don't support `less_equal`; we use `before:<tomorrow>`
-  // which is functionally `<= today`.
-  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  // refresh token doesn't carry the ZohoCRM.coql.READ scope. Zoho's search
+  // criteria API rejects relational date operators on Aria_Next_Retry_Date
+  // (tested: less_equal, before — both 400 with "invalid operator found").
+  // So we filter the date in JS after the fetch. Volume is bounded (max
+  // ~hundreds of pending retries), so the in-memory filter is fine.
   const statusGroup = RETRY_PENDING_STATUSES
     .map(s => `(Aria_Status:equals:${s})`)
     .join("or");
-  const criteria =
-    `(${statusGroup})` +
-    `and(Aria_Next_Retry_Date:before:${tomorrow})` +
-    `and(Aria_Attempt_Count:less_than:3)`;
+  const criteria = `(${statusGroup})and(Aria_Attempt_Count:less_than:3)`;
   const fields = "id,First_Name,Last_Name,Aria_Status,Aria_Attempt_Count,Aria_Next_Retry_Date,Country,Educational_Institute";
   const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
 
@@ -620,7 +618,18 @@ async function runRetryTick({ dryRun = false } = {}) {
   }
   // 204 No Content = no matching leads
   const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
-  const dueLeads = queryData?.data || [];
+  const allCandidates = queryData?.data || [];
+
+  // In-memory date filter: only leads whose retry date has actually arrived.
+  // Lead with null retry date is skipped (shouldn't normally happen — the
+  // no-answer flow always sets one — but guard anyway).
+  const dueLeads = allCandidates.filter(l => {
+    if (!l.Aria_Next_Retry_Date) return false;
+    return l.Aria_Next_Retry_Date <= today; // YYYY-MM-DD lex comparison is correct
+  });
+  if (allCandidates.length > dueLeads.length) {
+    console.log(`[RETRY-TICK] candidates=${allCandidates.length} due=${dueLeads.length} (${allCandidates.length - dueLeads.length} not yet due)`);
+  }
 
   console.log(`[RETRY-TICK] today=${today} found=${dueLeads.length} dryRun=${dryRun}`);
 

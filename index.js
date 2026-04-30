@@ -573,9 +573,12 @@ const RETRY_PENDING_STATUSES = [
 ];
 
 // Status to flip eligible leads to. Must match a value the Zoho Flow trigger
-// listens for to fire /zoho/aria-trigger. "Retry Aria EN" is the canonical
-// retry-trigger value distinct from the initial "Ready for Aria EN".
-const RETRY_TARGET_STATUS = "Retry Aria EN";
+// listens for to fire /zoho/aria-trigger. Verified empirically on 2026-04-30
+// that the Zoho Flow trigger fires on "Ready for Aria EN" but NOT on
+// "Retry Aria EN" — flipping to the latter leaves leads silently parked.
+// Use "Ready for Aria EN" until the Zoho Flow is extended to also watch
+// "Retry Aria EN" (separate work).
+const RETRY_TARGET_STATUS = "Ready for Aria EN";
 
 /**
  * Scan Zoho for leads whose retry date has arrived and flip them back into

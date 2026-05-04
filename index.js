@@ -14,6 +14,14 @@ const DATABASE_URL = process.env.DATABASE_URL;
 // Currently scoped to chat_* events only (see /webhooks/retell handler) so Aria voice flow
 // stays unverified for backward compatibility. Remove the chat-only gate to extend to voice.
 const RETELL_WEBHOOK_SECRET = process.env.RETELL_WEBHOOK_SECRET || null;
+// Signature enforcement mode: 'disabled' | 'observe' | 'enforce'.
+//   disabled = skip the signature check entirely (matches pre-patch behavior)
+//   observe  = run the check and log mismatches, but DO NOT drop events
+//   enforce  = drop the event on any mismatch (only flip to this once you've
+//              confirmed via observe-mode logs that signatures actually validate)
+// Default: 'observe' if a secret is set, otherwise 'disabled'. This makes deploy
+// safe even if RETELL_WEBHOOK_SECRET is misconfigured (e.g. holds an API key).
+const RETELL_SIGNATURE_MODE = (process.env.RETELL_SIGNATURE_MODE || (RETELL_WEBHOOK_SECRET ? "observe" : "disabled")).toLowerCase();
 
 // ─── Email Config (Resend HTTP API) ─────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
@@ -875,14 +883,29 @@ app.post("/webhooks/retell", async (req, res) => {
     const transcript = (chatData && chatData.transcript) || callData.transcript || null;
     const callAnalysis = (chatData && chatData.chat_analysis) || callData.call_analysis || null;
 
-    // Signature verification — scoped to chat_* events only for backward compatibility.
-    // When RETELL_WEBHOOK_SECRET is set, all incoming chat events must carry a valid
-    // x-retell-signature header. Aria voice events bypass this check (current behavior).
-    if (RETELL_WEBHOOK_SECRET && eventType.startsWith("chat_")) {
-      const signature = req.headers["x-retell-signature"];
-      if (!verifySignature(req.rawBody, signature)) {
-        console.error(`[ERR] [${receivedAt}] INVALID SIGNATURE on ${eventType} — event dropped.`);
-        return;
+    // Signature verification — chat_* events only, three modes (see RETELL_SIGNATURE_MODE):
+    //   disabled : skip
+    //   observe  : log mismatches, never drop the event
+    //   enforce  : drop the event on mismatch
+    // Always log the presence/absence of the x-retell-signature header on chat events
+    // so we have visibility into what Retell is actually sending.
+    if (eventType.startsWith("chat_") && RETELL_SIGNATURE_MODE !== "disabled") {
+      const signature = req.headers["x-retell-signature"] || null;
+      const sigPresent = !!signature;
+      if (!RETELL_WEBHOOK_SECRET) {
+        console.warn(`  [SIG] mode=${RETELL_SIGNATURE_MODE} but RETELL_WEBHOOK_SECRET unset — cannot verify`);
+      } else {
+        const ok = sigPresent && verifySignature(req.rawBody, signature);
+        if (!ok) {
+          const reason = !sigPresent ? "no x-retell-signature header" : "signature mismatch";
+          if (RETELL_SIGNATURE_MODE === "enforce") {
+            console.error(`  [SIG] enforce mode — DROPPING ${eventType} (${reason})`);
+            return;
+          }
+          console.warn(`  [SIG] observe mode — would drop ${eventType} (${reason}); event passed through`);
+        } else {
+          console.log(`  [SIG] verified ${eventType} signature`);
+        }
       }
     }
 

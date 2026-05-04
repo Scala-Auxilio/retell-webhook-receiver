@@ -1375,13 +1375,15 @@ function estimateConversionScore(data) {
   else if (timeline.includes("year") || timeline.includes("2026") || timeline.includes("2027")) score += 2;
   else if (timeline) score += 1;
 
-  // Meeting requested (0-4)
-  const meeting = (data.meeting_requested || "").toLowerCase();
+  // Meeting requested (0-4) — Retell chat events return this as a boolean,
+  // legacy voice events as a string. Coerce safely either way.
+  const meeting = String(data.meeting_requested ?? "").toLowerCase();
   if (meeting === "true" || meeting === "yes" || meeting.includes("yes")) score += 4;
   else if (meeting.includes("maybe") || meeting.includes("interested")) score += 2;
 
-  // Chat successful (0-4)
-  const successful = (data.chat_successful || data.Chat_Successful || "").toLowerCase();
+  // Chat successful (0-4) — Retell chat events return this as a boolean.
+  // Use ?? so we don't accidentally skip a literal false; coerce to string for toLowerCase.
+  const successful = String(data.chat_successful ?? data.Chat_Successful ?? "").toLowerCase();
   if (successful === "true" || successful === "yes" || successful.includes("yes")) score += 4;
   else if (successful.includes("partial")) score += 2;
 

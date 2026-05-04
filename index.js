@@ -1198,7 +1198,14 @@ app.post("/webhooks/retell", async (req, res) => {
 // values are never exposed.
 app.post("/api/fuel-savings", requireAuth, async (req, res) => {
   try {
-    const out = calculateFuelSavings(req.body || {});
+    // Retell custom-function POSTs wrap arguments as {name, call, args} by default.
+    // Accept both that shape and a flat top-level body so the endpoint also works
+    // for direct API calls and for "Payload: args only" mode.
+    const body = req.body || {};
+    const args = (body && typeof body === "object" && body.args && typeof body.args === "object")
+      ? body.args
+      : body;
+    const out = calculateFuelSavings(args);
     res.json(out);
   } catch (err) {
     res.status(400).json({ error: err.message });

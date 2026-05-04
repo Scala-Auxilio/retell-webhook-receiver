@@ -230,18 +230,40 @@ function isBusinessHours() {
   return day >= 1 && day <= 5 && totalMinutes >= 540 && totalMinutes < 1020;
 }
 
-// ─── Webhook signature verification (optional) ───────────────────────────────
+// ─── Webhook signature verification ──────────────────────────────────────────
+// Retell signs webhook events using this format (see Retell typescript SDK
+// src/lib/webhook_auth.ts):
+//
+//   x-retell-signature: v=<timestamp_ms>,d=<hex_digest>
+//   where  hex_digest = HMAC-SHA256(api_key, body + timestamp_ms)
+//
+// To verify: parse the v=...,d=... header, recompute the HMAC over body+ts,
+// timing-safe compare. We also enforce a 5-minute timestamp window to prevent
+// replay attacks (matches the SDK default).
+const RETELL_SIG_TIMEOUT_MS = 5 * 60 * 1000;
 function verifySignature(rawBody, signature) {
   if (!RETELL_WEBHOOK_SECRET) return true; // skip if no secret configured
-  if (!signature) {
-    console.warn("[WARN] No x-retell-signature header present — skipping verification.");
-    return true; // allow through but log warning
+  if (!signature) return false;
+  const match = /^v=(\d+),d=([0-9a-f]+)$/i.exec(signature);
+  if (!match) {
+    console.error(`Signature header format unexpected (got first 40 chars: ${String(signature).slice(0, 40)})`);
+    return false;
+  }
+  const ts = Number(match[1]);
+  const providedDigestHex = match[2];
+  if (!Number.isFinite(ts)) return false;
+  if (Math.abs(Date.now() - ts) > RETELL_SIG_TIMEOUT_MS) {
+    console.error(`Signature timestamp outside 5-min window (delta ms: ${Date.now() - ts})`);
+    return false;
   }
   try {
+    const bodyStr = typeof rawBody === "string" ? rawBody : rawBody.toString("utf-8");
     const hmac = crypto.createHmac("sha256", RETELL_WEBHOOK_SECRET);
-    hmac.update(rawBody);
-    const expected = hmac.digest("hex");
-    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+    hmac.update(bodyStr + ts);
+    const expected = hmac.digest(); // Buffer (32 bytes)
+    const provided = Buffer.from(providedDigestHex, "hex"); // 32 bytes
+    if (provided.length !== expected.length) return false;
+    return crypto.timingSafeEqual(expected, provided);
   } catch (err) {
     console.error("Signature verification error:", err.message);
     return false;

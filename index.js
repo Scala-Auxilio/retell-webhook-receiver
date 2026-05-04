@@ -26,6 +26,12 @@ const RETELL_SIGNATURE_MODE = (process.env.RETELL_SIGNATURE_MODE || (RETELL_WEBH
 // ─── Email Config (Resend HTTP API) ─────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 const NOTIFY_FROM = process.env.NOTIFY_FROM || "notifications@adsum-auxilio.com";
+// Separate FROM address for EconoWind/VentoBot alerts so they don't inherit
+// Aria's sendsteps.com branding. Defaults to notifications@adsum-auxilio.com
+// (already verified in Resend). To use a fully branded address like
+// ventobot@econowind.nl, first verify econowind.nl in Resend, then set
+// ECONOWIND_FROM in Railway env vars.
+const ECONOWIND_FROM = process.env.ECONOWIND_FROM || "notifications@adsum-auxilio.com";
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 
@@ -1420,7 +1426,7 @@ async function processEconowindLead(lead, receivedAt) {
     }
   }
 
-  await sendEmail({ from: NOTIFY_FROM, to: recipients, subject, text: textBody, html });
+  await sendEmail({ from: ECONOWIND_FROM, to: recipients, subject, text: textBody, html });
 
   await pool.query(
     `UPDATE econowind_leads SET notification_sent = TRUE WHERE company_name = $1 AND received_at = $2`,

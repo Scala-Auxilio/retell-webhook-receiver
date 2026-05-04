@@ -1404,11 +1404,15 @@ async function processEconowindLead(lead, receivedAt) {
 
   let recipients;
   if (ALERT_OVERRIDE_TO) {
-    // Test-mode override active: redirect every alert to the configured address.
-    // The original routing decision (manager + CC) is still recorded in the DB
-    // and the email body, just not used for delivery.
+    // Override active: redirect every alert to the configured address.
+    // ECONOWIND_CC_P1 (Piet) is CC'd on every alert during override (not only P1)
+    // so he can monitor what's flowing through. Original manager + region routing
+    // is still recorded in the DB and visible in the email body.
     recipients = [ALERT_OVERRIDE_TO];
-    console.log(`  [TEST-MODE] Alert override active — sending to ${ALERT_OVERRIDE_TO} instead of ${manager.email}`);
+    if (ECONOWIND_CC_P1 && ECONOWIND_CC_P1 !== ALERT_OVERRIDE_TO) {
+      recipients.push(ECONOWIND_CC_P1);
+    }
+    console.log(`  [OVERRIDE] Alert recipients: ${recipients.join(", ")} (would have routed to ${manager.email})`);
   } else {
     recipients = [manager.email];
     if (priorityInfo.priority === "P1" && ECONOWIND_CC_P1) {

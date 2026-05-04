@@ -66,7 +66,7 @@ const ECONOWIND_MANAGERS = {
 };
 const ECONOWIND_FALLBACK_MANAGER = { name: "Willem Stam", email: "stam@econowind.nl", region: "Fallback (unmapped region)" };
 // Also CC Piet on all P1 leads
-const ECONOWIND_CC_P1 = process.env.ECONOWIND_CC_P1 || "coelewijp@gmail.com";
+const ECONOWIND_CC_P1 = process.env.ECONOWIND_CC_P1 || "petrusc@adsum-auxilio.com";
 // TEST-MODE EMAIL OVERRIDE: when set, ALL EconoWind alert emails are routed to
 // this address instead of the region-routed sales manager. Used while the
 // VentoBot widget is in soft-launch / testing so real SMs don't get test alerts.

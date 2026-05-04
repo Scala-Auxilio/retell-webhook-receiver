@@ -31,7 +31,7 @@ const NOTIFY_FROM = process.env.NOTIFY_FROM || "notifications@adsum-auxilio.com"
 // (already verified in Resend). To use a fully branded address like
 // ventobot@econowind.nl, first verify econowind.nl in Resend, then set
 // ECONOWIND_FROM in Railway env vars.
-const ECONOWIND_FROM = process.env.ECONOWIND_FROM || "notifications@adsum-auxilio.com";
+const ECONOWIND_FROM = process.env.ECONOWIND_FROM || "petrusc@adsum-auxilio.com";
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 

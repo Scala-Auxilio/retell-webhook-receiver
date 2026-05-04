@@ -270,6 +270,139 @@ function verifySignature(rawBody, signature) {
   }
 }
 
+// ─── EconoWind Fuel Savings Calculator ──────────────────────────────────────
+// Port of Savings-formula-with-lookup-table-v2-1.xlsx. Internal-use only.
+// CRITICAL: returned object must NEVER include kW, DWT, ship coefficients,
+// regression internals, or VFxxxx model codes. The bot must only see
+// public-safe outputs (savings %, fuel saved tonnes, EUR cost saved, CO2).
+// Validated against Excel example: 4× 5-series on 225x38m general cargo,
+// 3000 mt/yr fuel, $600/t → central 11.4%, range 6.4–16.4%, 340.7 mt, $204,419.
+const FUEL_SHIP_TYPES = {
+  bulk_carrier:    { c_overall: 0.6724, kW: dwt => -4e-7 * dwt * dwt + 0.1711 * dwt + 2685 },
+  chemical_tanker: { c_overall: 0.7231375, kW: dwt => 0.1924 * dwt + 2361.2 },
+  container:       { c_overall: 0.3690, kW: dwt => 1.34065308990245e-11 * dwt**3 - 6.95891133407931e-6 * dwt**2 + 1.1415678527676 * dwt + 1626.88637088971 },
+  general_cargo:   { c_overall: 0.50225, kW: dwt => 0.4214 * dwt + 1230.6 },
+  lng_carrier:     { c_overall: 0.5084, kW: dwt => 0.4055 * dwt + 2450.6 },
+  general_tanker:  { c_overall: 0.6806, kW: dwt => 7.13541068768982e-12 * dwt**3 - 2.23621382448807e-6 * dwt**2 + 0.289235452661798 * dwt + 1777.70858928599 },
+  roro:            { c_overall: 0.1845, kW: dwt => 1.1938 * dwt + 2789.1 },
+};
+
+// Public series → internal kW per unit (never exposed).
+// 3-series maps to the 16m-wing variant; 5-series to the 30m-wing variant.
+const FUEL_VF_SERIES = {
+  "3-series": 50,
+  "5-series": 240,
+};
+
+// Common synonyms users / bot may pass — normalize to canonical ship_type keys.
+const FUEL_TYPE_ALIASES = {
+  "bulk": "bulk_carrier",
+  "bulker": "bulk_carrier",
+  "bulk carrier": "bulk_carrier",
+  "chemical tanker": "chemical_tanker",
+  "chem tanker": "chemical_tanker",
+  "chemical": "chemical_tanker",
+  "container": "container",
+  "container ship": "container",
+  "containership": "container",
+  "feeder": "container",
+  "general cargo": "general_cargo",
+  "gen cargo": "general_cargo",
+  "mpp": "general_cargo",
+  "multi-purpose": "general_cargo",
+  "multipurpose": "general_cargo",
+  "lng": "lng_carrier",
+  "lng carrier": "lng_carrier",
+  "lpg": "lng_carrier",
+  "lpg carrier": "lng_carrier",
+  "tanker": "general_tanker",
+  "general tanker": "general_tanker",
+  "product tanker": "general_tanker",
+  "crude tanker": "general_tanker",
+  "aframax": "general_tanker",
+  "suezmax": "general_tanker",
+  "vlcc": "general_tanker",
+  "mr tanker": "general_tanker",
+  "mr": "general_tanker",
+  "roro": "roro",
+  "ro-ro": "roro",
+  "ro ro": "roro",
+  "ferry": "roro",
+};
+
+const FUEL_THRUST_EFFICIENCY = 0.7;
+const FUEL_DRAUGHT_FACTOR = 1/3;
+const FUEL_WIND_AMPLIFICATION = 2;
+const FUEL_UNCERTAINTY_PP = 5;
+const FUEL_CO2_FACTOR = 3.146; // standard marine fuel
+const FUEL_USD_TO_EUR = 0.92;
+const FUEL_DEFAULT_PRICE_USD = 600;
+
+function normalizeShipType(input) {
+  if (!input) return null;
+  const k = String(input).toLowerCase().trim();
+  if (FUEL_SHIP_TYPES[k]) return k;
+  if (FUEL_TYPE_ALIASES[k]) return FUEL_TYPE_ALIASES[k];
+  return null;
+}
+
+function calculateFuelSavings(args) {
+  const ship_type = normalizeShipType(args.ship_type);
+  if (!ship_type) {
+    throw new Error(`Unknown ship_type. Accepted: bulk_carrier, chemical_tanker, container, general_cargo, lng_carrier, general_tanker, roro (or common synonyms).`);
+  }
+  const ship = FUEL_SHIP_TYPES[ship_type];
+  const series = String(args.series || "").trim().toLowerCase().replace(/\s+/g, "-");
+  const seriesKey = series === "3-series" ? "3-series" : (series === "5-series" ? "5-series" : null);
+  if (!seriesKey) throw new Error(`series must be "3-series" or "5-series"`);
+  const kw_per_unit = FUEL_VF_SERIES[seriesKey];
+  const units = Number(args.units);
+  if (!Number.isFinite(units) || units < 1) throw new Error("units must be a positive integer");
+  const length_m = Number(args.length_m);
+  const beam_m = Number(args.beam_m);
+  if (!Number.isFinite(length_m) || length_m <= 0) throw new Error("length_m required (positive number, in meters)");
+  if (!Number.isFinite(beam_m) || beam_m <= 0) throw new Error("beam_m required (positive number, in meters)");
+
+  // Internal estimation — NEVER return any of these values.
+  const draught_m = beam_m * FUEL_DRAUGHT_FACTOR;
+  const dwt = length_m * beam_m * draught_m * ship.c_overall;
+  const engine_kw = ship.kW(dwt);
+  const effective_thrust_kw = engine_kw * FUEL_THRUST_EFFICIENCY;
+  const vf_total_kw = kw_per_unit * units;
+  const central_ratio = (FUEL_WIND_AMPLIFICATION * vf_total_kw) / effective_thrust_kw;
+  const central_pct = central_ratio * 100;
+  const low_pct = Math.max(0, central_pct - FUEL_UNCERTAINTY_PP);
+  const high_pct = central_pct + FUEL_UNCERTAINTY_PP;
+
+  // PUBLIC-SAFE OUTPUT ONLY.
+  const out = {
+    savings_pct: {
+      low: Number(low_pct.toFixed(1)),
+      central: Number(central_pct.toFixed(1)),
+      high: Number(high_pct.toFixed(1)),
+    },
+    range_text: `${low_pct.toFixed(1)}% to ${high_pct.toFixed(1)}%`,
+    methodology_disclaimer: "Estimate based on EconoWind's internal sizing model; vessel-specific calibration happens before any quote.",
+  };
+
+  const annual_fuel_mt = Number(args.annual_fuel_mt);
+  if (Number.isFinite(annual_fuel_mt) && annual_fuel_mt > 0) {
+    const fuel_price_usd = Number(args.fuel_price_usd) || FUEL_DEFAULT_PRICE_USD;
+    const fuel_saved = annual_fuel_mt * central_ratio;
+    const cost_usd = fuel_saved * fuel_price_usd;
+    const cost_eur = cost_usd * FUEL_USD_TO_EUR;
+    out.annual_fuel_saved_tonnes = Math.round(fuel_saved);
+    out.annual_cost_saved_eur = Math.round(cost_eur);
+    out.annual_cost_saved_eur_text = `~€${Math.round(cost_eur).toLocaleString("en-EU")} per year (approximate; based on ${fuel_price_usd} USD/tonne, EUR rate may vary at quoting time)`;
+    out.annual_co2_saved_tonnes = Math.round(fuel_saved * FUEL_CO2_FACTOR);
+    out.confidence = "with_fuel_consumption";
+  } else {
+    out.note_for_bot = "If the visitor can share annual fuel consumption (tonnes/year), I can also return cost savings in EUR and CO2 reduction.";
+    out.confidence = "percent_only";
+  }
+  return out;
+}
+
 // ─── Express app ──────────────────────────────────────────────────────────────
 const app = express();
 
@@ -1054,6 +1187,21 @@ app.post("/webhooks/retell", async (req, res) => {
     // Log the error and the full payload so nothing is silently lost.
     console.error(`  [ERR] DB write failed:`, err.message);
     console.error(`  [ERR] Payload that failed to store:`, JSON.stringify(req.body).substring(0, 500));
+  }
+});
+
+
+// ─── EconoWind Fuel Savings API (called by VentoBot custom function) ────────
+// Returns vessel-specific savings estimates derived from the internal sizing
+// model. Auth-gated so only the Retell custom function (with NOTIFY_SECRET
+// header) can hit it. All output fields are public-safe — internal kW/DWT
+// values are never exposed.
+app.post("/api/fuel-savings", requireAuth, async (req, res) => {
+  try {
+    const out = calculateFuelSavings(req.body || {});
+    res.json(out);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

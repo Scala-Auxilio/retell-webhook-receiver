@@ -67,6 +67,11 @@ const ECONOWIND_MANAGERS = {
 const ECONOWIND_FALLBACK_MANAGER = { name: "Willem Stam", email: "stam@econowind.nl", region: "Fallback (unmapped region)" };
 // Also CC Piet on all P1 leads
 const ECONOWIND_CC_P1 = process.env.ECONOWIND_CC_P1 || "coelewijp@gmail.com";
+// TEST-MODE EMAIL OVERRIDE: when set, ALL EconoWind alert emails are routed to
+// this address instead of the region-routed sales manager. Used while the
+// VentoBot widget is in soft-launch / testing so real SMs don't get test alerts.
+// Leave unset (or set to empty string in Railway) to enable production region routing.
+const ALERT_OVERRIDE_TO = process.env.ALERT_OVERRIDE_TO || "engelage@econowind.nl";
 
 if (!DATABASE_URL) {
   console.error("FATAL: DATABASE_URL environment variable is not set.");
@@ -1397,9 +1402,18 @@ async function processEconowindLead(lead, receivedAt) {
   const html = buildLeadEmailHtml(lead, priorityInfo, manager);
   const textBody = `${priorityInfo.priority} - ${priorityInfo.label}\n\nNew EconoWind Lead: ${lead.company_name}\nContact: ${lead.contact_name} (${lead.contact_email})\nRegion: ${lead.region}\nScores: Revenue ${lead.revenue_score}/25, Conversion ${lead.conversion_score}/18\nSLA: ${priorityInfo.sla}\nAssigned to: ${manager.name}`;
 
-  const recipients = [manager.email];
-  if (priorityInfo.priority === "P1" && ECONOWIND_CC_P1) {
-    recipients.push(ECONOWIND_CC_P1);
+  let recipients;
+  if (ALERT_OVERRIDE_TO) {
+    // Test-mode override active: redirect every alert to the configured address.
+    // The original routing decision (manager + CC) is still recorded in the DB
+    // and the email body, just not used for delivery.
+    recipients = [ALERT_OVERRIDE_TO];
+    console.log(`  [TEST-MODE] Alert override active — sending to ${ALERT_OVERRIDE_TO} instead of ${manager.email}`);
+  } else {
+    recipients = [manager.email];
+    if (priorityInfo.priority === "P1" && ECONOWIND_CC_P1) {
+      recipients.push(ECONOWIND_CC_P1);
+    }
   }
 
   await sendEmail({ from: NOTIFY_FROM, to: recipients, subject, text: textBody, html });

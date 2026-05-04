@@ -32,6 +32,14 @@ const NOTIFY_FROM = process.env.NOTIFY_FROM || "notifications@adsum-auxilio.com"
 // ventobot@econowind.nl, first verify econowind.nl in Resend, then set
 // ECONOWIND_FROM in Railway env vars.
 const ECONOWIND_FROM = process.env.ECONOWIND_FROM || "petrusc@adsum-auxilio.com";
+
+// ─── VentoBot Sandbox Page Config ───────────────────────────────────────────
+// Public-facing test page that embeds the Retell widget. Set RETELL_PUBLIC_KEY
+// in Railway env to activate; without it the page returns a friendly error.
+// Set SANDBOX_PASSWORD to gate the page behind a simple shared password.
+const RETELL_PUBLIC_KEY = process.env.RETELL_PUBLIC_KEY || null;
+const SANDBOX_PASSWORD = process.env.SANDBOX_PASSWORD || null;
+const SANDBOX_AGENT_ID = "agent_760482429951f50e816c47b55a";
 const NOTIFY_TO = process.env.NOTIFY_TO || null;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || null;
 
@@ -425,6 +433,102 @@ function requireAuth(req, res, next) {
   }
   next();
 }
+
+
+// ─── VentoBot Sandbox: public test page for the sales team ──────────────────
+// Renders a simple HTML page with the Retell chat widget embedded. Optional
+// password gate via SANDBOX_PASSWORD env var. Returns a friendly message if
+// RETELL_PUBLIC_KEY is not configured.
+function renderSandboxPage() {
+  if (!RETELL_PUBLIC_KEY) {
+    return `<!doctype html><html><head><title>VentoBot Sandbox</title><meta name="robots" content="noindex,nofollow"></head><body style="font-family:-apple-system,sans-serif;max-width:520px;margin:80px auto;padding:24px;color:#1a1a1a"><h2 style="color:#00c48c">VentoBot Sandbox — not yet configured</h2><p>Set the <code>RETELL_PUBLIC_KEY</code> environment variable on Railway to activate this page.</p></body></html>`;
+  }
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>VentoBot Sandbox — EconoWind</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1a1a1a; background: #f7f9fb; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 48px 24px 200px; }
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; background: #00c48c; color: white; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+  h1 { font-size: 28px; margin: 16px 0 8px; }
+  p.lead { color: #555; font-size: 16px; line-height: 1.5; margin: 0 0 32px; }
+  .card { background: white; border: 1px solid #e3e8ee; border-radius: 12px; padding: 24px; margin-bottom: 16px; }
+  .card h3 { margin: 0 0 12px; font-size: 16px; color: #1a1a1a; }
+  .card p, .card li { color: #555; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }
+  .card ul { margin: 8px 0; padding-left: 20px; }
+  .footer { text-align: center; color: #999; font-size: 12px; margin-top: 32px; }
+  code { background: #f0f4f8; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="badge">Internal Test</span>
+  <h1>VentoBot Sandbox</h1>
+  <p class="lead">This is the EconoWind chat agent in pre-go-live testing. Open the chat (bottom right corner) and try a conversation as if you were a prospect.</p>
+
+  <div class="card">
+    <h3>Things worth testing</h3>
+    <ul>
+      <li>Ask for a fuel savings estimate for a specific vessel ("4 5-series on a 225m × 38m general cargo, 3000 mt/year fuel")</li>
+      <li>Try the pricing redirect ("just give me a ballpark")</li>
+      <li>Ask about CII, FuelEU, EEXI — see how it bridges to economics</li>
+      <li>Push for a meeting / share contact details — see the qualification close</li>
+      <li>Try a different language (Dutch, German, Italian, French, Spanish)</li>
+      <li>Ask "how was that calculated" after a savings number — should refuse to share methodology</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>What happens when you complete a chat</h3>
+    <p>Every qualified test chat triggers a real alert email to <strong>Stijn Engelage</strong> (with Petrus on CC). Stijn knows this is sandbox traffic — please don't worry about cluttering his inbox during testing. Just be aware test data shows up in our pipeline like a real lead.</p>
+  </div>
+
+  <div class="card">
+    <h3>Feedback</h3>
+    <p>Anything that feels off — clunky phrasing, wrong route, missed handoff, leaked detail — please send to <strong>Petrus</strong> with the rough conversation summary. We can pull the full transcript from the backend if needed.</p>
+  </div>
+
+  <div class="footer">VentoBot Sandbox · agent v6 · ${new Date().toISOString().split("T")[0]}</div>
+</div>
+
+<script id="retell-widget"
+  src="https://dashboard.retellai.com/retell-widget.js"
+  type="module"
+  data-public-key="${RETELL_PUBLIC_KEY}"
+  data-agent-id="${SANDBOX_AGENT_ID}"
+  data-agent-version="0"
+  data-title="Chat with EconoWind"
+  data-color="#00c48c"
+  data-bot-name="VentoBot"
+  data-popup-message="Need help with VentoFoil? I can answer your questions."
+  data-show-ai-popup="true"
+  data-show-ai-popup-time="3">
+</script>
+</body>
+</html>`;
+}
+
+app.get("/sandbox", (req, res) => {
+  // Optional password gate: if SANDBOX_PASSWORD env is set, require ?key=PASSWORD
+  // OR a SANDBOX_KEY cookie. Simple gate — designed to keep casual link-leaks
+  // from reaching the sandbox, not real auth.
+  if (SANDBOX_PASSWORD) {
+    const provided = (req.query.key || (req.headers.cookie || "").match(/SANDBOX_KEY=([^;]+)/)?.[1] || "");
+    if (provided !== SANDBOX_PASSWORD) {
+      const wrong = req.query.key && req.query.key !== SANDBOX_PASSWORD;
+      return res.status(401).send(`<!doctype html><html><head><title>VentoBot Sandbox</title><meta name="robots" content="noindex,nofollow"></head><body style="font-family:-apple-system,sans-serif;max-width:380px;margin:120px auto;padding:24px"><h3 style="color:#00c48c">VentoBot Sandbox</h3>${wrong ? '<p style="color:#c33;font-size:14px">Wrong password.</p>' : ''}<form method="get" action="/sandbox"><input name="key" type="password" placeholder="Sandbox password" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:14px;margin-bottom:8px" autofocus><button type="submit" style="width:100%;padding:10px;background:#00c48c;color:white;border:0;border-radius:6px;font-size:14px;cursor:pointer">Enter</button></form></body></html>`);
+    }
+    res.setHeader("Set-Cookie", `SANDBOX_KEY=${SANDBOX_PASSWORD}; Path=/sandbox; Max-Age=${30*24*60*60}; SameSite=Lax`);
+  }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(renderSandboxPage());
+});
 
 // ─── Business hours endpoint (for Retell custom functions / transfer logic) ──
 app.get("/business-hours", (_req, res) => {

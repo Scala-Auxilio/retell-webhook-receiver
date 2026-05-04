@@ -10,7 +10,18 @@ const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGE
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
-const RETELL_WEBHOOK_SECRET = null; // HOTFIX 2026-04-10: disabled until proper Retell SDK signature verification is implemented (see notes)
+// Retell webhook signature verification — set RETELL_WEBHOOK_SECRET in env to enable.
+// Currently scoped to chat_* events only (see /webhooks/retell handler) so Aria voice flow
+// stays unverified for backward compatibility. Remove the chat-only gate to extend to voice.
+const RETELL_WEBHOOK_SECRET = process.env.RETELL_WEBHOOK_SECRET || null;
+// Signature enforcement mode: 'disabled' | 'observe' | 'enforce'.
+//   disabled = skip the signature check entirely (matches pre-patch behavior)
+//   observe  = run the check and log mismatches, but DO NOT drop events
+//   enforce  = drop the event on any mismatch (only flip to this once you've
+//              confirmed via observe-mode logs that signatures actually validate)
+// Default: 'observe' if a secret is set, otherwise 'disabled'. This makes deploy
+// safe even if RETELL_WEBHOOK_SECRET is misconfigured (e.g. holds an API key).
+const RETELL_SIGNATURE_MODE = (process.env.RETELL_SIGNATURE_MODE || (RETELL_WEBHOOK_SECRET ? "observe" : "disabled")).toLowerCase();
 
 // ─── Email Config (Resend HTTP API) ─────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
@@ -858,23 +869,45 @@ app.post("/webhooks/retell", async (req, res) => {
 
   try {
     const payload = req.body;
+    const eventType = payload.event || "unknown";
 
-    // Signature verification
-    if (RETELL_WEBHOOK_SECRET) {
-      const signature = req.headers["x-retell-signature"];
-      if (!verifySignature(req.rawBody, signature)) {
-        console.error(`[ERR] [${receivedAt}] INVALID SIGNATURE — event dropped.`);
-        return;
+    // Retell wraps chat events under payload.chat and voice events under payload.call.
+    // Detect channel and extract into the same variable names so downstream Aria
+    // code is untouched. Chat agents (VentoBot) emit chat_started / chat_ended /
+    // chat_analyzed; voice agents (Aria) emit call_started / call_ended / call_analyzed.
+    const chatData = payload.chat || null;
+    const callData = payload.call || {};
+    const isChat = !!chatData;
+    const agentId = (chatData && chatData.agent_id) || callData.agent_id || null;
+    const callId = (chatData && chatData.chat_id) || callData.call_id || null;
+    const transcript = (chatData && chatData.transcript) || callData.transcript || null;
+    const callAnalysis = (chatData && chatData.chat_analysis) || callData.call_analysis || null;
+
+    // Signature verification — chat_* events only, three modes (see RETELL_SIGNATURE_MODE):
+    //   disabled : skip
+    //   observe  : log mismatches, never drop the event
+    //   enforce  : drop the event on mismatch
+    // Always log the presence/absence of the x-retell-signature header on chat events
+    // so we have visibility into what Retell is actually sending.
+    if (eventType.startsWith("chat_") && RETELL_SIGNATURE_MODE !== "disabled") {
+      const signature = req.headers["x-retell-signature"] || null;
+      const sigPresent = !!signature;
+      if (!RETELL_WEBHOOK_SECRET) {
+        console.warn(`  [SIG] mode=${RETELL_SIGNATURE_MODE} but RETELL_WEBHOOK_SECRET unset — cannot verify`);
+      } else {
+        const ok = sigPresent && verifySignature(req.rawBody, signature);
+        if (!ok) {
+          const reason = !sigPresent ? "no x-retell-signature header" : "signature mismatch";
+          if (RETELL_SIGNATURE_MODE === "enforce") {
+            console.error(`  [SIG] enforce mode — DROPPING ${eventType} (${reason})`);
+            return;
+          }
+          console.warn(`  [SIG] observe mode — would drop ${eventType} (${reason}); event passed through`);
+        } else {
+          console.log(`  [SIG] verified ${eventType} signature`);
+        }
       }
     }
-
-    // Extract fields from payload
-    const eventType = payload.event || "unknown";
-    const callData = payload.call || {};
-    const agentId = callData.agent_id || null;
-    const callId = callData.call_id || null;
-    const transcript = callData.transcript || null;
-    const callAnalysis = callData.call_analysis || null;
 
     // Map agent IDs to friendly names for logging
     const agentNames = {
@@ -900,11 +933,22 @@ app.post("/webhooks/retell", async (req, res) => {
     console.log(`  [OK] Stored in retell_events.`);
 
     // ─── EconoWind auto-routing: detect VentoBot chats and trigger lead scoring ──
+    // VentoBot is a chat agent — it emits chat_analyzed when post-chat analysis
+    // completes. We also accept call_analyzed in case a future VentoBot voice variant
+    // is added. The Retell post-chat custom fields are nested under
+    // chat_analysis.custom_analysis_data, so flatten before passing to the mapper.
     const ECONOWIND_AGENT_ID = "agent_760482429951f50e816c47b55a";
-    if (agentId === ECONOWIND_AGENT_ID && eventType === "call_ended" && callAnalysis) {
-      console.log(`  [EW] EconoWind chat ended — extracting lead data from post-chat analysis...`);
+    const isAnalyzedEvent = eventType === "chat_analyzed" || eventType === "call_analyzed";
+    if (agentId === ECONOWIND_AGENT_ID && isAnalyzedEvent && callAnalysis) {
+      console.log(`  [EW] EconoWind ${eventType} — extracting lead data from post-chat analysis...`);
       try {
-        const lead = mapRetellToEconowindLead(callAnalysis, transcript);
+        const flatAnalysis = {
+          ...(callAnalysis.custom_analysis_data || {}),
+          chat_summary: callAnalysis.chat_summary,
+          user_sentiment: callAnalysis.user_sentiment,
+          chat_successful: callAnalysis.chat_successful,
+        };
+        const lead = mapRetellToEconowindLead(flatAnalysis, transcript);
         if (lead) {
           await processEconowindLead(lead, receivedAt);
         } else {
@@ -1026,7 +1070,7 @@ app.post("/notify", requireAuth, async (req, res) => {
 });
 
 // ─── Notification history endpoint ───────────────────────────────────────────
-app.get("/notifications", async (req, res) => {
+app.get("/notifications", requireAuth, async (req, res) => {
   try {
     const { limit = 50 } = req.query;
     const result = await pool.query(
@@ -1084,7 +1128,29 @@ app.get("/events", async (req, res) => {
     params.push(Math.min(parseInt(limit) || 100, 500));
 
     const result = await pool.query(query, params);
-    res.json({ count: result.rows.length, events: result.rows });
+
+    // PII protection: full payloads (transcripts, analysis, raw payload) are
+    // returned only when the request carries a valid x-notify-secret header.
+    // Without auth, the response is metadata-only — preserves existing
+    // monitoring access (e.g. Paperclip heartbeat) while protecting visitor PII.
+    const auth = req.headers["x-notify-secret"];
+    const authenticated = NOTIFY_SECRET && auth === NOTIFY_SECRET;
+    const events = authenticated
+      ? result.rows
+      : result.rows.map(row => ({
+          id: row.id,
+          event_type: row.event_type,
+          agent_id: row.agent_id,
+          call_id: row.call_id,
+          received_at: row.received_at,
+          transcript: row.transcript ? "[REDACTED — provide x-notify-secret for full access]" : null,
+          call_analysis: row.call_analysis ? { redacted: true } : null,
+        }));
+    res.json({
+      count: events.length,
+      events,
+      ...(authenticated ? {} : { access: "metadata-only" }),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1890,7 +1956,7 @@ app.get("/reports/daily-calls", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/econowind/leads", async (req, res) => {
+app.get("/econowind/leads", requireAuth, async (req, res) => {
   try {
     const { priority, since, limit = 50 } = req.query;
     let query = "SELECT * FROM econowind_leads WHERE 1=1";

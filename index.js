@@ -87,6 +87,15 @@ const ECONOWIND_CC_P1 = process.env.ECONOWIND_CC_P1 || "petrusc@adsum-auxilio.co
 // Leave unset (or set to empty string in Railway) to enable production region routing.
 const ALERT_OVERRIDE_TO = process.env.ALERT_OVERRIDE_TO || "engelage@econowind.nl";
 
+// SANDBOX MANAGER OVERRIDE: when set, routeToManager() returns this instead of
+// the region-routed manager. The "real" routing decision is preserved in the
+// returned region string so the email body still reflects what would have
+// happened in production. Useful during sandbox to hide individual managers
+// (e.g. Willem) and surface a single point-of-contact (e.g. Stijn) regardless
+// of region. Leave both unset for normal regional routing.
+const SANDBOX_MANAGER_NAME = process.env.SANDBOX_MANAGER_NAME || null;
+const SANDBOX_MANAGER_EMAIL = process.env.SANDBOX_MANAGER_EMAIL || null;
+
 if (!DATABASE_URL) {
   console.error("FATAL: DATABASE_URL environment variable is not set.");
   process.exit(1);
@@ -1462,15 +1471,32 @@ function classifyPriority(revenueScore, conversionScore) {
 }
 
 function routeToManager(region) {
-  if (!region) return ECONOWIND_FALLBACK_MANAGER;
-  const key = region.toLowerCase().replace(/[\s-]+/g, "_").replace(/[^a-z_]/g, "");
-  // Try direct match first, then fuzzy
-  if (ECONOWIND_MANAGERS[key]) return ECONOWIND_MANAGERS[key];
-  // Check if region string contains any known key
-  for (const [k, mgr] of Object.entries(ECONOWIND_MANAGERS)) {
-    if (key.includes(k) || k.includes(key)) return mgr;
+  // Compute the natural regional routing first — we keep this in the returned
+  // object's region field so logs / email bodies still indicate what would
+  // have happened in production, even when the override is active.
+  let natural;
+  if (!region) {
+    natural = ECONOWIND_FALLBACK_MANAGER;
+  } else {
+    const key = region.toLowerCase().replace(/[\s-]+/g, "_").replace(/[^a-z_]/g, "");
+    if (ECONOWIND_MANAGERS[key]) natural = ECONOWIND_MANAGERS[key];
+    else {
+      let fuzzy = null;
+      for (const [k, mgr] of Object.entries(ECONOWIND_MANAGERS)) {
+        if (key.includes(k) || k.includes(key)) { fuzzy = mgr; break; }
+      }
+      natural = fuzzy || ECONOWIND_FALLBACK_MANAGER;
+    }
   }
-  return ECONOWIND_FALLBACK_MANAGER;
+  // Sandbox override: hide individual managers behind a single test contact.
+  if (SANDBOX_MANAGER_NAME) {
+    return {
+      name: SANDBOX_MANAGER_NAME,
+      email: SANDBOX_MANAGER_EMAIL || natural.email,
+      region: `Sandbox override (would have routed to ${natural.name} for ${natural.region})`,
+    };
+  }
+  return natural;
 }
 
 function buildLeadEmailHtml(lead, priorityInfo, manager) {

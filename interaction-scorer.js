@@ -378,6 +378,204 @@ async function scoreCallWithLLM({ transcript, callMetadata }) {
   return parsed;
 }
 
+
+// ─── Deterministic tier classifier ─────────────────────────────────────────
+// We override Claude's tier output with a code-side classifier because:
+//   - Strict rule: Incident requires score≤25 AND fault=aria AND a recognised
+//     incident pattern. Claude was too liberal (flagged "silent_on_ivr_*" as
+//     Incident even though those are internal/learning issues, not external
+//     embarrassments worth paging Petrus about).
+//   - Code-side classification is deterministic, predictable, and easy to
+//     adjust without re-prompting the LLM.
+const INCIDENT_FAILURE_MODE_PATTERNS = [
+  /fabricat|hallucin|false[_ ]fact|made[_ ]up|invent/,
+  /disclosure[_ ]refus|denied[_ ]ai|pretended[_ ]human|lied[_ ]about[_ ]ai/,
+  /pushy|aggressive|interrupt(ed|ing)|offensive|rude/,
+  /gdpr|pecr|compliance[_ ]violation/,
+  /loop(ed|ing)?[_ ]?(forever|endless)?|garbled|prompt[_ ]?broke|repeat[_ ]?endless/,
+];
+function classifyTier(scoreTotal, faultAttribution, keyFailureMode) {
+  if (scoreTotal === null || scoreTotal === undefined) return null;
+  const score = Number(scoreTotal);
+  if (score >= 76) return "Strong";
+  if (score >= 51) return "Solid";
+  if (score >= 26) return "Learning Opportunity";
+  // Score 0-25 — Incident requires aria-fault AND an actual incident pattern
+  if (faultAttribution !== "aria") return "Learning Opportunity";
+  const fm = String(keyFailureMode || "").toLowerCase();
+  const isIncident = INCIDENT_FAILURE_MODE_PATTERNS.some(p => p.test(fm));
+  return isIncident ? "Incident" : "Learning Opportunity";
+}
+
+// ─── Public scoring function — used by endpoint AND webhook hook ───────────
+// Wraps fetch-call + LLM-score + DB-persist into one reusable function.
+// Idempotent: returns existing score if call already scored unless force=true.
+async function scoreAndPersist({ pool, call_id, force = false }) {
+  if (!call_id) throw new Error("scoreAndPersist: call_id required");
+
+  // Skip if already scored (unless forced)
+  if (!force) {
+    const existing = await pool.query(
+      `SELECT id, total_score, tier, scored_at FROM interaction_scores WHERE call_id = $1`,
+      [call_id]
+    );
+    if (existing.rowCount > 0) {
+      return { ok: true, already_scored: true, ...existing.rows[0] };
+    }
+  }
+
+  const RETELL_API_KEY = process.env.RETELL_API_KEY;
+  if (!RETELL_API_KEY) throw new Error("RETELL_API_KEY not configured");
+  const callRes = await fetch(`https://api.retellai.com/v2/get-call/${encodeURIComponent(call_id)}`, {
+    headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
+  });
+  if (!callRes.ok) {
+    const errText = await callRes.text().catch(() => "");
+    throw new Error(`Retell fetch failed (${callRes.status}): ${errText}`);
+  }
+  const callData = await callRes.json();
+  const dvs = callData.retell_llm_dynamic_variables || {};
+  const ca = callData.call_analysis || {};
+  const cad = ca.custom_analysis_data || {};
+
+  const score = await scoreCallWithLLM({
+    transcript: callData.transcript || "",
+    callMetadata: {
+      call_id: callData.call_id,
+      duration_ms: callData.duration_ms,
+      disconnection_reason: callData.disconnection_reason,
+      to_number: callData.to_number,
+      prospect_first_name: dvs.prospect_first_name,
+      university_name: dvs.university_name,
+      persona_type: dvs.persona_type,
+      call_outcome: cad.call_outcome || cad.call_disposition,
+      call_summary: ca.call_summary,
+    },
+  });
+
+  // Pull score_total from various possible shapes Claude may return
+  const scoresObj = score.scores || score.dimensions || {};
+  const dimScores = {};
+  let totalScore = null;
+  if (typeof score.score_total === "number") totalScore = score.score_total;
+  else if (typeof score.total_score === "number") totalScore = score.total_score;
+  // Normalise dimension scores into flat shape: {connection_quality: 15, ...}
+  for (const k of Object.keys(scoresObj)) {
+    const v = scoresObj[k];
+    dimScores[k] = (typeof v === "object" && v !== null && "score" in v) ? v.score : v;
+  }
+  // If totalScore not given, sum the dim scores
+  if (totalScore === null) {
+    totalScore = Object.values(dimScores)
+      .filter(v => typeof v === "number")
+      .reduce((a, b) => a + b, 0);
+  }
+
+  // Override Claude's tier with deterministic classification
+  const finalTier = classifyTier(totalScore, score.fault_attribution, score.key_failure_mode);
+
+  const insert = await pool.query(`
+    INSERT INTO interaction_scores
+      (call_id, agent_id, agent_type, rubric_version, dimension_scores,
+       total_score, max_score, pct_score, outcome, flags, notes, scored_at,
+       tier, fault_attribution, incident_type, rejection_reason,
+       what_went_well, what_went_wrong, key_failure_mode, exemplar_snippets, scored_by)
+    VALUES
+      ($1, $2, $3, '2.0', $4,
+       $5, 100, $6, $7, $8, $9, NOW(),
+       $10, $11, $12, $13, $14, $15, $16, $17, 'auto-haiku')
+    ON CONFLICT (call_id) DO UPDATE SET
+       dimension_scores = EXCLUDED.dimension_scores,
+       total_score      = EXCLUDED.total_score,
+       pct_score        = EXCLUDED.pct_score,
+       outcome          = EXCLUDED.outcome,
+       tier             = EXCLUDED.tier,
+       fault_attribution= EXCLUDED.fault_attribution,
+       incident_type    = EXCLUDED.incident_type,
+       rejection_reason = EXCLUDED.rejection_reason,
+       what_went_well   = EXCLUDED.what_went_well,
+       what_went_wrong  = EXCLUDED.what_went_wrong,
+       key_failure_mode = EXCLUDED.key_failure_mode,
+       exemplar_snippets= EXCLUDED.exemplar_snippets,
+       rubric_version   = '2.0',
+       scored_by        = 'auto-haiku',
+       scored_at        = NOW()
+    RETURNING id
+  `, [
+    call_id,
+    callData.agent_id || null,
+    "aria",
+    JSON.stringify(dimScores),
+    totalScore,
+    totalScore,
+    cad.call_outcome || cad.call_disposition || null,
+    JSON.stringify({}),
+    score.what_went_wrong || null,
+    finalTier,
+    score.fault_attribution,
+    score.incident_type || null,
+    score.rejection_reason || null,
+    score.what_went_well,
+    score.what_went_wrong,
+    score.key_failure_mode,
+    JSON.stringify(score.exemplar_snippets || []),
+  ]);
+
+  console.log(`[SCORER-AUTO] call=${call_id} score=${totalScore}/100 tier=${finalTier} fault=${score.fault_attribution} mode=${score.key_failure_mode}`);
+  return { ok: true, score_id: insert.rows[0].id, score: { ...score, tier: finalTier, score_total: totalScore } };
+}
+
+// ─── Sweep: catch any unscored Aria calls in the last N hours ──────────────
+async function runScorerSweep({ pool, hoursBack = 24, agentIds = ["agent_aa56b68b02f6de4ac5725a829b"] }) {
+  const RETELL_API_KEY = process.env.RETELL_API_KEY;
+  if (!RETELL_API_KEY) throw new Error("RETELL_API_KEY not configured");
+  const since = Date.now() - hoursBack * 60 * 60 * 1000;
+
+  // Fetch recent Aria calls from Retell
+  const listRes = await fetch("https://api.retellai.com/v2/list-calls", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${RETELL_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      limit: 100,
+      filter_criteria: { agent_id: agentIds, start_timestamp: { lower_threshold: since } },
+      sort_order: "descending",
+    }),
+  });
+  if (!listRes.ok) throw new Error(`list-calls failed (${listRes.status})`);
+  const calls = await listRes.json();
+
+  // Filter to call_analyzed-eligible (have a transcript / completed)
+  const candidates = calls.filter(c =>
+    c.call_status === "ended" &&
+    c.transcript && c.transcript.length > 50 &&
+    c.disconnection_reason !== "dial_no_answer"
+  );
+
+  // Find which already have scores
+  const ids = candidates.map(c => c.call_id);
+  if (ids.length === 0) return { ok: true, candidates: 0, scored: 0, errors: 0 };
+  const existingRes = await pool.query(
+    `SELECT call_id FROM interaction_scores WHERE call_id = ANY($1::text[])`,
+    [ids]
+  );
+  const alreadyScored = new Set(existingRes.rows.map(r => r.call_id));
+  const toScore = candidates.filter(c => !alreadyScored.has(c.call_id));
+
+  console.log(`[SCORER-SWEEP] hoursBack=${hoursBack} candidates=${candidates.length} alreadyScored=${alreadyScored.size} toScore=${toScore.length}`);
+
+  let scored = 0, errors = 0;
+  for (const c of toScore) {
+    try {
+      await scoreAndPersist({ pool, call_id: c.call_id });
+      scored++;
+    } catch (err) {
+      console.error(`[SCORER-SWEEP] failed call_id=${c.call_id}: ${err.message}`);
+      errors++;
+    }
+  }
+  return { ok: errors === 0, candidates: candidates.length, scored, errors, skipped: alreadyScored.size };
+}
+
 // ─── Database table for scores ──────────────────────────────────────────────
 
 async function initScorerTable(pool) {
@@ -423,7 +621,7 @@ async function initScorerTable(pool) {
 
 // ─── Express route handlers ─────────────────────────────────────────────────
 
-function registerRoutes(app, pool) {
+function registerRoutes(app, pool, { requireAuth = (req, res, next) => next() } = {}) {
   // ─── Auto-scoring endpoint (LLM-driven) ──────────────────────────────────
   // POST /scorer/auto-score
   //   Body: { call_id: "call_xxx", force?: bool }
@@ -434,106 +632,27 @@ function registerRoutes(app, pool) {
     try {
       const { call_id, force } = req.body || {};
       if (!call_id) return res.status(400).json({ error: "Missing call_id" });
-
-      // Skip if already scored
-      if (!force) {
-        const existing = await pool.query(
-          `SELECT id, total_score, tier, scored_at FROM interaction_scores WHERE call_id = $1`,
-          [call_id]
-        );
-        if (existing.rowCount > 0) {
-          return res.json({ ok: true, already_scored: true, ...existing.rows[0] });
-        }
-      }
-
-      // Fetch the call from Retell
-      const RETELL_API_KEY = process.env.RETELL_API_KEY;
-      if (!RETELL_API_KEY) return res.status(500).json({ error: "RETELL_API_KEY not configured" });
-      const callRes = await fetch(`https://api.retellai.com/v2/get-call/${encodeURIComponent(call_id)}`, {
-        headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
-      });
-      if (!callRes.ok) {
-        const errText = await callRes.text().catch(() => "");
-        return res.status(502).json({ error: `Retell fetch failed (${callRes.status}): ${errText}` });
-      }
-      const callData = await callRes.json();
-
-      const dvs = callData.retell_llm_dynamic_variables || {};
-      const ca = callData.call_analysis || {};
-      const cad = ca.custom_analysis_data || {};
-
-      const score = await scoreCallWithLLM({
-        transcript: callData.transcript || "",
-        callMetadata: {
-          call_id: callData.call_id,
-          duration_ms: callData.duration_ms,
-          disconnection_reason: callData.disconnection_reason,
-          to_number: callData.to_number,
-          prospect_first_name: dvs.prospect_first_name,
-          university_name: dvs.university_name,
-          persona_type: dvs.persona_type,
-          call_outcome: cad.call_outcome || cad.call_disposition,
-          call_summary: ca.call_summary,
-        },
-      });
-
-      // Persist
-      const dimensionScores = score.scores || {};
-      const totalScore = score.score_total ?? 0;
-      const insert = await pool.query(`
-        INSERT INTO interaction_scores
-          (call_id, agent_id, agent_type, rubric_version, dimension_scores,
-           total_score, max_score, pct_score, outcome, flags, notes, scored_at,
-           tier, fault_attribution, incident_type, rejection_reason,
-           what_went_well, what_went_wrong, key_failure_mode, exemplar_snippets, scored_by)
-        VALUES
-          ($1, $2, $3, '2.0', $4,
-           $5, 100, $6, $7, $8, $9, NOW(),
-           $10, $11, $12, $13, $14, $15, $16, $17, 'auto-haiku')
-        ON CONFLICT (call_id) DO UPDATE SET
-           dimension_scores = EXCLUDED.dimension_scores,
-           total_score      = EXCLUDED.total_score,
-           pct_score        = EXCLUDED.pct_score,
-           outcome          = EXCLUDED.outcome,
-           tier             = EXCLUDED.tier,
-           fault_attribution= EXCLUDED.fault_attribution,
-           incident_type    = EXCLUDED.incident_type,
-           rejection_reason = EXCLUDED.rejection_reason,
-           what_went_well   = EXCLUDED.what_went_well,
-           what_went_wrong  = EXCLUDED.what_went_wrong,
-           key_failure_mode = EXCLUDED.key_failure_mode,
-           exemplar_snippets= EXCLUDED.exemplar_snippets,
-           rubric_version   = '2.0',
-           scored_by        = 'auto-haiku',
-           scored_at        = NOW()
-        RETURNING id
-      `, [
-        call_id,
-        callData.agent_id || null,
-        "aria",
-        JSON.stringify(dimensionScores),
-        totalScore,
-        totalScore,
-        cad.call_outcome || cad.call_disposition || null,
-        JSON.stringify({}),
-        score.what_went_wrong || null,
-        score.tier,
-        score.fault_attribution,
-        score.incident_type || null,
-        score.rejection_reason || null,
-        score.what_went_well,
-        score.what_went_wrong,
-        score.key_failure_mode,
-        JSON.stringify(score.exemplar_snippets || []),
-      ]);
-
-      console.log(`[SCORER-AUTO] call=${call_id} score=${totalScore}/${100} tier=${score.tier} fault=${score.fault_attribution}`);
-      res.json({ ok: true, score_id: insert.rows[0].id, score });
+      const result = await scoreAndPersist({ pool, call_id, force: !!force });
+      res.json(result);
     } catch (err) {
       console.error("[SCORER-AUTO] Error:", err.message);
       res.status(500).json({ error: err.message });
     }
   });
+
+  // POST /scorer/sweep — backfill scoring for any unscored Aria calls
+  // Auth-gated. Body: { hoursBack?: 24 }
+  app.post("/scorer/sweep", requireAuth, async (req, res) => {
+    try {
+      const hoursBack = Number(req.body?.hoursBack ?? req.query?.hoursBack ?? 24);
+      const result = await runScorerSweep({ pool, hoursBack });
+      res.json(result);
+    } catch (err) {
+      console.error("[SCORER-SWEEP] Error:", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
 
 
 
@@ -791,6 +910,9 @@ module.exports = {
   ARIA_RUBRIC_V1,      // deprecated; kept for historical reference
   ARIA_RUBRIC_V2,      // active
   ECONOWIND_RUBRIC,
-  scoreCallWithLLM,    // exported so the main webhook can fire-and-forget
+  scoreCallWithLLM,
+  scoreAndPersist,     // exported so the main webhook can fire-and-forget
+  runScorerSweep,      // exported for use in scheduled cron
+  classifyTier,
   HAIKU_MODEL,
 };

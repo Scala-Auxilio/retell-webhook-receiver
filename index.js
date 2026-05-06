@@ -1294,6 +1294,23 @@ app.post("/webhooks/retell", async (req, res) => {
           ).catch(() => {});
         }
       }
+
+      // Fire-and-forget: auto-score this call (Agent A). Only on call_analyzed
+      // (when transcript + analysis exist) and only when we have a meaningful
+      // transcript. Don't await — scoring takes ~5s and we don't want to block
+      // the webhook response.
+      if (eventType === "call_analyzed" &&
+          callId &&
+          (callData.transcript || "").length > 50 &&
+          process.env.ANTHROPIC_API_KEY) {
+        scorer.scoreAndPersist({ pool, call_id: callId })
+          .then(r => {
+            const total = r.score?.score_total ?? r.total_score ?? "?";
+            const tier = r.score?.tier ?? r.tier ?? "?";
+            console.log(`  [SCORER] auto-scored ${callId} -> ${total}/100 ${tier}`);
+          })
+          .catch(err => console.error(`  [SCORER] auto-score failed for ${callId}:`, err.message));
+      }
     }
   } catch (err) {
     // DB write failed — we already returned 200 to Retell so it won't retry.
@@ -1788,7 +1805,7 @@ app.post("/webhooks/econowind", requireAuth, async (req, res) => {
 calendly.registerRoutes(app, { sendEmail });
 
 // ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
-scorer.registerRoutes(app, pool);
+scorer.registerRoutes(app, pool, { requireAuth });
 
 // ─── Odoo CRM Proxy (pipeline monitoring for Paperclip agents) ──────────────
 odooProxy.registerRoutes(app, pool);
@@ -2320,6 +2337,32 @@ app.get("/econowind/leads", requireAuth, async (req, res) => {
 // full business day to redial. Cron can be disabled by setting
 // ARIA_RETRY_CRON=off (e.g. when running multi-replica — only one replica
 // should hold the cron).
+function scheduleScorerSweepCron() {
+  if (process.env.SCORER_SWEEP_CRON === "off") {
+    console.log("[CRON] Scorer sweep DISABLED via SCORER_SWEEP_CRON=off");
+    return;
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.warn("[CRON] Scorer sweep NOT scheduled - ANTHROPIC_API_KEY not configured");
+    return;
+  }
+  cron.schedule(
+    "15 * * * *",
+    async () => {
+      const startedAt = new Date().toISOString();
+      console.log(`[CRON] Running scorer sweep (${startedAt})`);
+      try {
+        const result = await scorer.runScorerSweep({ pool, hoursBack: 24 });
+        console.log(`[CRON] Scorer sweep complete: candidates=${result.candidates} scored=${result.scored} skipped=${result.skipped} errors=${result.errors}`);
+      } catch (err) {
+        console.error("[CRON] Scorer sweep failed:", err.message);
+      }
+    },
+    { timezone: "Europe/London" }
+  );
+  console.log("[CRON] Scorer sweep scheduled - hourly at minute 15");
+}
+
 function scheduleRetryTickCron() {
   if (process.env.ARIA_RETRY_CRON === "off") {
     console.log("[CRON] Aria retry tick DISABLED via ARIA_RETRY_CRON=off");
@@ -2351,6 +2394,7 @@ async function start() {
   try {
     await initDatabase();
     scheduleRetryTickCron();
+    scheduleScorerSweepCron();
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Retell Webhook Receiver v1.7.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);

@@ -15,7 +15,8 @@
 
 // ─── Scoring Rubric (Sendsteps Aria SDR) ──────────────────────────────────────
 
-const ARIA_RUBRIC = {
+// v1.0 retained for historical reference only — no longer used for new scoring.
+const ARIA_RUBRIC_V1 = {
   dimensions: [
     {
       id: "opening",
@@ -177,9 +178,210 @@ const ECONOWIND_RUBRIC = {
   ],
 };
 
+
+// ─── ACTIVE Rubric (Sendsteps Aria SDR) — v2.0 ─────────────────────────────
+// 4 dimensions × 25 points = 100 total. Canonical reference document:
+// /AI Sales/Aria_Scoring_Rubric_v1.md (note: doc filename says "v1" but
+// content describes the v2.0 rubric — naming preserved for the user's bookmarks).
+// Replaces v1.0 (which used 6 dimensions × 0-3 scoring).
+
+const ARIA_RUBRIC_V2 = {
+  version: "2.0",
+  total_points: 100,
+  framing: "Growth-oriented. Low scores are learning gradients, not malfunctions. Critical Incident tier requires score ≤ 25 AND fault_attribution=aria AND a recognised incident type.",
+  dimensions: [
+    {
+      id: "connection_quality",
+      name: "Connection Quality",
+      weight: 25,
+      description: "How Aria handled the phone-line reality (IVR, voicemail, switchboard, hold)",
+      anchors: [
+        { points: 25, criteria: "Reached the named prospect directly within 30 seconds" },
+        { points: 20, criteria: "Reached a competent gatekeeper (PA, dept secretary) within 45 seconds" },
+        { points: 15, criteria: "Reached switchboard/reception. Navigated cleanly" },
+        { points: 10, criteria: "Hit IVR. Pressed correct digits. Reached a human (even if not the right one)" },
+        { points: 5,  criteria: "Hit IVR. Got stuck or escaped on time-out, but did not speak over the recording" },
+        { points: 0,  criteria: "Spoke OVER the IVR. OR narrated her own state out loud. OR rang voicemail without detecting it" },
+      ],
+    },
+    {
+      id: "opener_execution",
+      name: "Opener Execution",
+      weight: 25,
+      description: "How well she executed the opening 30 seconds when she got a human. Score null if no human reached.",
+      anchors: [
+        { points: 25, criteria: "Full opener with personalisation (name, university, value prop). Natural. AI disclosure handled confidently if asked" },
+        { points: 20, criteria: "Opener delivered cleanly but slightly robotic or rushed" },
+        { points: 15, criteria: "Opener delivered but missed personalisation OR fumbled AI disclosure" },
+        { points: 10, criteria: "Skipped opener and went straight to qualifying — works but loses email anchor" },
+        { points: 5,  criteria: "Confused, repeated herself, or asked identity-confirmation after IVR (which she shouldn't)" },
+        { points: 0,  criteria: "Stayed silent when a human spoke, OR opened with narration ('I am calling on behalf of...')" },
+      ],
+      n_a_when: "no_human_reached",
+    },
+    {
+      id: "discovery_adaptation",
+      name: "Discovery & Adaptation",
+      weight: 25,
+      description: "How she handled what the human said. Score null if no human reached.",
+      anchors: [
+        { points: 25, criteria: "Asked the right qualifying question (faculty vs procurement). Listened. Adapted with relevant follow-up" },
+        { points: 20, criteria: "Asked qualifying but follow-up was generic / scripted" },
+        { points: 15, criteria: "Asked qualifying but ignored prospect's response and pushed next script step" },
+        { points: 10, criteria: "Got an objection and handled it acceptably" },
+        { points: 5,  criteria: "Got an objection and either argued OR collapsed too fast" },
+        { points: 0,  criteria: "Didn't ask any question, OR asked the same thing twice" },
+      ],
+      n_a_when: "no_human_reached",
+    },
+    {
+      id: "outcome_closure",
+      name: "Outcome & Closure",
+      weight: 25,
+      description: "Whether the call ended with the right disposition for what happened",
+      anchors: [
+        { points: 25, criteria: "Booking made (Calendly slot confirmed) OR genuine callback scheduled with time+number captured OR referral email/extension captured cleanly" },
+        { points: 20, criteria: "Lead expressed clear interest, end-of-call set up follow-up by email/note appropriately" },
+        { points: 15, criteria: "Polite 'not now' close OR voicemail correctly hung up for retry OR not-interested with valid prospect-side reason (see rejection_reason_scores)" },
+        { points: 10, criteria: "Wrong-person but Aria captured gatekeeper's name + tried for redirect" },
+        { points: 5,  criteria: "Wrong-person and Aria hung up without trying to capture a referral" },
+        { points: 0,  criteria: "Hung up mid-conversation OR ended a productive call abruptly OR booked into nothing" },
+      ],
+    },
+  ],
+
+  // When call_outcome is "not_interested", score the Outcome dimension based on REASON
+  rejection_reason_scores: {
+    "already_have_solution":   20, // clean prospect-side reason
+    "wrong_role_department":   15, // should have captured referral
+    "bad_timing":              20, // budget freeze / mid-semester / restructure
+    "dont_want_ai":            10, // track frequency — pivot may need work
+    "aria_couldnt_explain":     0, // Aria's fault — flag for prompt review
+    "aria_unclear_voice":       0, // TTS/pace issue
+    "aria_pushy":               0, // behaviour issue
+    "no_reason_given":         10, // default
+  },
+
+  tiers: [
+    { range: [76, 100], name: "Strong",                 action: "Capture as exemplar. Cite in prompt-change proposals to protect against regression. Eligible for periodic prompt-refresh inclusion." },
+    { range: [51,  75], name: "Solid",                  action: "Aggregate weekly. Surface what went well in digest." },
+    { range: [26,  50], name: "Learning Opportunity",   action: "Track. Pattern of 5+ same-failure-mode in 7 days triggers diagnostic prompt-improvement email." },
+    { range: [ 0,  25], name: "Incident",               action: "Email Petrus within 1h IF fault_attribution=aria AND incident_type set. Otherwise treat as Learning Opportunity (low scores from external factors are not Incidents)." },
+  ],
+
+  incident_types: [
+    "fabricated_facts",
+    "ai_disclosure_refused",
+    "offensive_or_pushy",
+    "compliance_violation",
+    "prompt_breakage_loop_or_garbled",
+  ],
+
+  fault_attribution_values: ["aria", "external", "mixed"],
+};
+
+// Convenience alias — code path that imports `ARIA_RUBRIC` should resolve to v2.
+const ARIA_RUBRIC = ARIA_RUBRIC_V2;
+
+// ─── LLM-based auto-scorer (uses Anthropic Claude Haiku 4.5) ────────────────
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
+
+let _anthropicClient = null;
+function getAnthropicClient() {
+  if (_anthropicClient) return _anthropicClient;
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error("ANTHROPIC_API_KEY not configured. Add it to Railway env vars to enable auto-scoring.");
+  }
+  const Anthropic = require("@anthropic-ai/sdk");
+  _anthropicClient = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+  return _anthropicClient;
+}
+
+function buildScoringSystemPrompt() {
+  return `You are a sales call quality analyst. You score calls made by Aria, an AI SDR for Sendsteps (an interactive presentation platform for universities).
+
+RUBRIC (v2.0):
+${JSON.stringify(ARIA_RUBRIC_V2, null, 2)}
+
+INSTRUCTIONS:
+1. Read the call transcript carefully.
+2. Score each of the 4 dimensions (0-25). If no human was reached, set Opener Execution and Discovery & Adaptation to null (NOT 0).
+3. For Outcome & Closure, if disposition is "not_interested", classify the rejection_reason and use the corresponding score from rejection_reason_scores.
+4. Set fault_attribution: "aria" if Aria's behaviour caused the failure, "external" if it was the IVR/switchboard/data quality, "mixed" if both.
+5. Set tier based on total score AND fault_attribution: Incident requires score ≤ 25 AND fault_attribution=aria AND a recognised incident_type. Otherwise low scores fall in Learning Opportunity.
+6. Identify key_failure_mode in 2-4 words (e.g., "spoke_over_ivr", "gatekeeper_pivot_missed", "ai_disclosure_fumbled").
+7. Provide what_went_well and what_went_wrong in 1-2 sentences each, drawing from specific transcript moments.
+8. For Strong-tier calls (≥76), include 1-3 exemplar_snippets — short transcript excerpts (max 200 chars each) demonstrating the specific behaviour worth amplifying.
+
+OUTPUT: ONLY a single JSON object. No prose before or after. No markdown code fences. Just the raw JSON.
+
+Schema:
+{
+  "scores": {
+    "connection_quality": <0-25 or null>,
+    "opener_execution":   <0-25 or null>,
+    "discovery_adaptation": <0-25 or null>,
+    "outcome_closure":    <0-25>
+  },
+  "score_total": <sum of non-null scores; if some are null, scale to 100 proportionally>,
+  "tier": "Strong" | "Solid" | "Learning Opportunity" | "Incident",
+  "fault_attribution": "aria" | "external" | "mixed",
+  "incident_type": <one of incident_types or null>,
+  "key_failure_mode": "<short_snake_case>",
+  "what_went_well": "<1-2 sentences>",
+  "what_went_wrong": "<1-2 sentences>",
+  "rejection_reason": <one of rejection_reason_scores keys, or null>,
+  "exemplar_snippets": [<up to 3 short strings>]
+}`;
+}
+
+function buildScoringUserPrompt({ transcript, callMetadata }) {
+  const meta = {
+    call_id: callMetadata.call_id,
+    duration_seconds: Math.round((callMetadata.duration_ms || 0) / 1000),
+    disconnection_reason: callMetadata.disconnection_reason,
+    to_number: callMetadata.to_number,
+    prospect_first_name: callMetadata.prospect_first_name,
+    university_name: callMetadata.university_name,
+    persona_type: callMetadata.persona_type,
+    retell_call_outcome: callMetadata.call_outcome,
+    retell_call_summary: callMetadata.call_summary,
+  };
+  return `CALL METADATA:
+${JSON.stringify(meta, null, 2)}
+
+TRANSCRIPT:
+${transcript || "(empty)"}`;
+}
+
+async function scoreCallWithLLM({ transcript, callMetadata }) {
+  const client = getAnthropicClient();
+  const response = await client.messages.create({
+    model: HAIKU_MODEL,
+    max_tokens: 2000,
+    system: buildScoringSystemPrompt(),
+    messages: [{ role: "user", content: buildScoringUserPrompt({ transcript, callMetadata }) }],
+  });
+  const text = response.content[0].text;
+  // Strip code fences if Claude added them despite instruction
+  const cleaned = text.replace(/^```(json)?\s*/m, "").replace(/```\s*$/m, "").trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new Error(`LLM returned non-JSON: ${cleaned.slice(0, 200)}`);
+  }
+  parsed.rubric_version = "2.0";
+  parsed.scored_at = new Date().toISOString();
+  parsed.model = HAIKU_MODEL;
+  return parsed;
+}
+
 // ─── Database table for scores ──────────────────────────────────────────────
 
 async function initScorerTable(pool) {
+  // Base table — v1.0 schema, unchanged for backward compat with human scoring
   await pool.query(`
     CREATE TABLE IF NOT EXISTS interaction_scores (
       id              SERIAL PRIMARY KEY,
@@ -198,18 +400,142 @@ async function initScorerTable(pool) {
       UNIQUE(call_id)
     );
   `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_interaction_scores_agent_id ON interaction_scores (agent_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_interaction_scores_scored_at ON interaction_scores (scored_at);`);
+
+  // v2.0 additive columns — auto-scoring fields. Idempotent: ADD COLUMN IF NOT EXISTS.
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_interaction_scores_agent_id ON interaction_scores (agent_id);
+    ALTER TABLE interaction_scores
+      ADD COLUMN IF NOT EXISTS tier              VARCHAR(32),
+      ADD COLUMN IF NOT EXISTS fault_attribution VARCHAR(16),
+      ADD COLUMN IF NOT EXISTS incident_type     VARCHAR(48),
+      ADD COLUMN IF NOT EXISTS rejection_reason  VARCHAR(48),
+      ADD COLUMN IF NOT EXISTS what_went_well    TEXT,
+      ADD COLUMN IF NOT EXISTS what_went_wrong   TEXT,
+      ADD COLUMN IF NOT EXISTS key_failure_mode  VARCHAR(64),
+      ADD COLUMN IF NOT EXISTS exemplar_snippets JSONB,
+      ADD COLUMN IF NOT EXISTS scored_by         VARCHAR(32) DEFAULT 'human'
   `);
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_interaction_scores_scored_at ON interaction_scores (scored_at);
-  `);
-  console.log("Database table interaction_scores ready.");
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_interaction_scores_tier ON interaction_scores (tier);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_interaction_scores_fault ON interaction_scores (fault_attribution);`);
+  console.log("Database table interaction_scores ready (v2.0 schema).");
 }
 
 // ─── Express route handlers ─────────────────────────────────────────────────
 
 function registerRoutes(app, pool) {
+  // ─── Auto-scoring endpoint (LLM-driven) ──────────────────────────────────
+  // POST /scorer/auto-score
+  //   Body: { call_id: "call_xxx", force?: bool }
+  //   Fetches the call from Retell, scores it with Claude Haiku 4.5, writes
+  //   the result to interaction_scores. Idempotent: returns existing score
+  //   if already scored unless force=true.
+  app.post("/scorer/auto-score", async (req, res) => {
+    try {
+      const { call_id, force } = req.body || {};
+      if (!call_id) return res.status(400).json({ error: "Missing call_id" });
+
+      // Skip if already scored
+      if (!force) {
+        const existing = await pool.query(
+          `SELECT id, total_score, tier, scored_at FROM interaction_scores WHERE call_id = $1`,
+          [call_id]
+        );
+        if (existing.rowCount > 0) {
+          return res.json({ ok: true, already_scored: true, ...existing.rows[0] });
+        }
+      }
+
+      // Fetch the call from Retell
+      const RETELL_API_KEY = process.env.RETELL_API_KEY;
+      if (!RETELL_API_KEY) return res.status(500).json({ error: "RETELL_API_KEY not configured" });
+      const callRes = await fetch(`https://api.retellai.com/v2/get-call/${encodeURIComponent(call_id)}`, {
+        headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
+      });
+      if (!callRes.ok) {
+        const errText = await callRes.text().catch(() => "");
+        return res.status(502).json({ error: `Retell fetch failed (${callRes.status}): ${errText}` });
+      }
+      const callData = await callRes.json();
+
+      const dvs = callData.retell_llm_dynamic_variables || {};
+      const ca = callData.call_analysis || {};
+      const cad = ca.custom_analysis_data || {};
+
+      const score = await scoreCallWithLLM({
+        transcript: callData.transcript || "",
+        callMetadata: {
+          call_id: callData.call_id,
+          duration_ms: callData.duration_ms,
+          disconnection_reason: callData.disconnection_reason,
+          to_number: callData.to_number,
+          prospect_first_name: dvs.prospect_first_name,
+          university_name: dvs.university_name,
+          persona_type: dvs.persona_type,
+          call_outcome: cad.call_outcome || cad.call_disposition,
+          call_summary: ca.call_summary,
+        },
+      });
+
+      // Persist
+      const dimensionScores = score.scores || {};
+      const totalScore = score.score_total ?? 0;
+      const insert = await pool.query(`
+        INSERT INTO interaction_scores
+          (call_id, agent_id, agent_type, rubric_version, dimension_scores,
+           total_score, max_score, pct_score, outcome, flags, notes, scored_at,
+           tier, fault_attribution, incident_type, rejection_reason,
+           what_went_well, what_went_wrong, key_failure_mode, exemplar_snippets, scored_by)
+        VALUES
+          ($1, $2, $3, '2.0', $4,
+           $5, 100, $6, $7, $8, $9, NOW(),
+           $10, $11, $12, $13, $14, $15, $16, $17, 'auto-haiku')
+        ON CONFLICT (call_id) DO UPDATE SET
+           dimension_scores = EXCLUDED.dimension_scores,
+           total_score      = EXCLUDED.total_score,
+           pct_score        = EXCLUDED.pct_score,
+           outcome          = EXCLUDED.outcome,
+           tier             = EXCLUDED.tier,
+           fault_attribution= EXCLUDED.fault_attribution,
+           incident_type    = EXCLUDED.incident_type,
+           rejection_reason = EXCLUDED.rejection_reason,
+           what_went_well   = EXCLUDED.what_went_well,
+           what_went_wrong  = EXCLUDED.what_went_wrong,
+           key_failure_mode = EXCLUDED.key_failure_mode,
+           exemplar_snippets= EXCLUDED.exemplar_snippets,
+           rubric_version   = '2.0',
+           scored_by        = 'auto-haiku',
+           scored_at        = NOW()
+        RETURNING id
+      `, [
+        call_id,
+        callData.agent_id || null,
+        "aria",
+        JSON.stringify(dimensionScores),
+        totalScore,
+        totalScore,
+        cad.call_outcome || cad.call_disposition || null,
+        JSON.stringify({}),
+        score.what_went_wrong || null,
+        score.tier,
+        score.fault_attribution,
+        score.incident_type || null,
+        score.rejection_reason || null,
+        score.what_went_well,
+        score.what_went_wrong,
+        score.key_failure_mode,
+        JSON.stringify(score.exemplar_snippets || []),
+      ]);
+
+      console.log(`[SCORER-AUTO] call=${call_id} score=${totalScore}/${100} tier=${score.tier} fault=${score.fault_attribution}`);
+      res.json({ ok: true, score_id: insert.rows[0].id, score });
+    } catch (err) {
+      console.error("[SCORER-AUTO] Error:", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+
 
   /**
    * GET /scorer/rubric
@@ -461,6 +787,10 @@ function registerRoutes(app, pool) {
 module.exports = {
   registerRoutes,
   initScorerTable,
-  ARIA_RUBRIC,
+  ARIA_RUBRIC,         // alias for V2 (for backward-compat imports)
+  ARIA_RUBRIC_V1,      // deprecated; kept for historical reference
+  ARIA_RUBRIC_V2,      // active
   ECONOWIND_RUBRIC,
+  scoreCallWithLLM,    // exported so the main webhook can fire-and-forget
+  HAIKU_MODEL,
 };

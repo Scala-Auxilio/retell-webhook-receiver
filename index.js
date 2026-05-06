@@ -6,6 +6,7 @@ const calendly = require("./calendly");
 const scorer = require("./interaction-scorer");
 const odooProxy = require("./odoo-proxy");
 const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
+const analyst = require("./intelligence-analyst");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -1806,6 +1807,7 @@ calendly.registerRoutes(app, { sendEmail });
 
 // ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
 scorer.registerRoutes(app, pool, { requireAuth });
+analyst.registerAnalystRoutes(app, { pool, sendEmail, requireAuth });
 
 // ─── Odoo CRM Proxy (pipeline monitoring for Paperclip agents) ──────────────
 odooProxy.registerRoutes(app, pool);
@@ -2363,6 +2365,51 @@ function scheduleScorerSweepCron() {
   console.log("[CRON] Scorer sweep scheduled - hourly at minute 15");
 }
 
+// ─── Intelligence Analyst (Agent B) crons ──────────────────────────────
+function scheduleAnalystCrons() {
+  if (process.env.INTELLIGENCE_ANALYST_CRON === "off") {
+    console.log("[CRON] Intelligence Analyst DISABLED via INTELLIGENCE_ANALYST_CRON=off");
+    return;
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.warn("[CRON] Intelligence Analyst NOT scheduled - ANTHROPIC_API_KEY not configured");
+    return;
+  }
+  if (!RESEND_API_KEY) {
+    console.warn("[CRON] Intelligence Analyst NOT scheduled - RESEND_API_KEY not configured");
+    return;
+  }
+  // Weekly digest — Sunday 18:00 Europe/London
+  cron.schedule(
+    "0 18 * * 0",
+    async () => {
+      console.log(`[CRON] Running weekly digest (${new Date().toISOString()})`);
+      try {
+        const r = await analyst.runWeeklyDigest({ pool, sendEmail });
+        console.log(`[CRON] Weekly digest sent: calls_scored=${r.calls_scored} to=${r.sent_to}`);
+      } catch (err) {
+        console.error("[CRON] Weekly digest failed:", err.message);
+      }
+    },
+    { timezone: "Europe/London" }
+  );
+  // Daily diagnostic check — 17:00 Europe/London
+  cron.schedule(
+    "0 17 * * *",
+    async () => {
+      console.log(`[CRON] Running daily diagnostic check (${new Date().toISOString()})`);
+      try {
+        const r = await analyst.runDiagnosticPatternCheck({ pool, sendEmail });
+        console.log(`[CRON] Diagnostic check: clusters=${r.clusters_found} proposals_sent=${r.proposals_sent}`);
+      } catch (err) {
+        console.error("[CRON] Diagnostic check failed:", err.message);
+      }
+    },
+    { timezone: "Europe/London" }
+  );
+  console.log("[CRON] Intelligence Analyst scheduled — weekly digest Sun 18:00, daily diagnostic 17:00 (Europe/London)");
+}
+
 function scheduleRetryTickCron() {
   if (process.env.ARIA_RETRY_CRON === "off") {
     console.log("[CRON] Aria retry tick DISABLED via ARIA_RETRY_CRON=off");
@@ -2393,8 +2440,10 @@ function scheduleRetryTickCron() {
 async function start() {
   try {
     await initDatabase();
+    await analyst.initAnalystTables(pool);
     scheduleRetryTickCron();
     scheduleScorerSweepCron();
+    scheduleAnalystCrons();
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Retell Webhook Receiver v1.7.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);

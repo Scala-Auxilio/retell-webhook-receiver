@@ -524,6 +524,135 @@ function renderSandboxPage() {
 </html>`;
 }
 
+// ─── Chat-Aria Sandbox Page (Sendsteps registration chatbot test page) ─────
+// Public-facing test page that embeds the chat-aria-en Retell widget.
+// Same RETELL_PUBLIC_KEY + SANDBOX_PASSWORD gating as VentoBot sandbox.
+const CHAT_ARIA_AGENT_ID = "agent_4edb3c94541c725dd1c5c344de";
+
+function renderChatAriaSandboxPage() {
+  if (!RETELL_PUBLIC_KEY) {
+    return `<!doctype html><html><head><title>Aria Chat Sandbox</title><meta name="robots" content="noindex,nofollow"></head><body style="font-family:-apple-system,sans-serif;max-width:520px;margin:80px auto;padding:24px;color:#1a1a1a"><h2 style="color:#1F3A5F">Aria Chat Sandbox — not yet configured</h2><p>Set the <code>RETELL_PUBLIC_KEY</code> environment variable on Railway to activate this page.</p></body></html>`;
+  }
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Aria Chat Sandbox — Sendsteps</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1a1a1a; background: #f7f9fb; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 48px 24px 200px; }
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; background: #1F3A5F; color: white; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+  h1 { font-size: 28px; margin: 16px 0 8px; color: #1F3A5F; }
+  p.lead { color: #555; font-size: 16px; line-height: 1.5; margin: 0 0 32px; }
+  .card { background: white; border: 1px solid #e3e8ee; border-radius: 12px; padding: 24px; margin-bottom: 16px; }
+  .card h3 { margin: 0 0 12px; font-size: 16px; color: #1F3A5F; }
+  .card p, .card li { color: #555; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }
+  .card ul { margin: 8px 0; padding-left: 20px; }
+  .footer { text-align: center; color: #999; font-size: 12px; margin-top: 32px; }
+  code { background: #f0f4f8; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  .tier-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .tier-table th, .tier-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eef1f4; }
+  .tier-table th { color: #555; font-weight: 600; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 8px; font-size: 11px; font-weight: 600; color: white; }
+  .pill-1 { background: #C00000; }
+  .pill-2 { background: #ED7D31; }
+  .pill-3 { background: #4472C4; }
+  .pill-4 { background: #7F7F7F; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="badge">Internal Test</span>
+  <h1>Aria Chat Sandbox</h1>
+  <p class="lead">This is the Sendsteps registration-page chatbot in pre-go-live testing. Open the chat (bottom right) and try a conversation as if you were a prospective customer landing on /register or /pricing.</p>
+
+  <div class="card">
+    <h3>Test scenarios — try one of each tier</h3>
+    <table class="tier-table">
+      <tr><th>Profile</th><th>What to say</th><th>Expected</th></tr>
+      <tr>
+        <td><span class="pill pill-1">Tier 1</span> Buyer</td>
+        <td>"Hi, I'm head of teaching at UCL, planning to use this with about 600 students next semester"</td>
+        <td>Aria offers a demo, asks for preferred day, books via book_demo</td>
+      </tr>
+      <tr>
+        <td><span class="pill pill-2">Tier 2</span> Mid-size</td>
+        <td>"I'm at NHL Stenden, lecturer, ~200 students per cohort"</td>
+        <td>Aria guides to free trial, captures lead</td>
+      </tr>
+      <tr>
+        <td><span class="pill pill-3">Tier 3</span> Smaller HE</td>
+        <td>"I'm a learning designer at a small private college, 80-student class"</td>
+        <td>Aria guides to free trial, light email follow-up</td>
+      </tr>
+      <tr>
+        <td><span class="pill pill-4">Tier 4</span> End-user</td>
+        <td>"Just trying it out for a personal training session, 20 people"</td>
+        <td>Aria guides to trial; lead queued for voice-Aria outbound check</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Things worth probing</h3>
+    <ul>
+      <li>Ask about pricing — should redirect to /pricing, not invent numbers</li>
+      <li>Ask "are you a real person?" — should disclose AI immediately</li>
+      <li>Ask for a human — should offer Slack/email handoff</li>
+      <li>Push back on the demo offer — should fall back gracefully to trial</li>
+      <li>Use a Hispanic university email (.es / .mx) — should still route to Petrus</li>
+      <li>Ask about competitors (Mentimeter, Slido, Poll Everywhere) — should not trash-talk</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>What happens when you complete a chat</h3>
+    <p>Every test chat with a captured email triggers a real Zoho lead create + alert email to <strong>Petrus</strong>. The lead source will show as <code>Sendsteps Chat — Aria</code> and the conversation summary lives in <code>Aria_Notes</code>. Use a <code>+sandbox</code> alias in your test email (e.g. <code>yourname+sandbox@...</code>) so the leads are easy to filter and clean up later.</p>
+  </div>
+
+  <div class="card">
+    <h3>Feedback</h3>
+    <p>Anything that feels off — clunky phrasing, wrong tier classification, missed booking, awkward handoff — please send to <strong>Petrus</strong> with the rough conversation summary. We can pull the full transcript from the backend.</p>
+  </div>
+
+  <div class="footer">Aria Chat Sandbox · ${CHAT_ARIA_AGENT_ID} · ${new Date().toISOString().split("T")[0]}</div>
+</div>
+
+<script id="retell-widget"
+  src="https://dashboard.retellai.com/retell-widget.js"
+  type="module"
+  data-public-key="${RETELL_PUBLIC_KEY}"
+  data-agent-id="${CHAT_ARIA_AGENT_ID}"
+  data-agent-version="0"
+  data-title="Chat with Aria"
+  data-color="#1F3A5F"
+  data-bot-name="Aria"
+  data-popup-message="Hi! I'm Aria — happy to answer any questions about Sendsteps before you sign up."
+  data-show-ai-popup="true"
+  data-show-ai-popup-time="3">
+</script>
+</body>
+</html>`;
+}
+
+app.get("/sandbox/aria", (req, res) => {
+  // Same password gate as /sandbox (shares SANDBOX_PASSWORD)
+  if (SANDBOX_PASSWORD) {
+    const provided = (req.query.key || (req.headers.cookie || "").match(/SANDBOX_KEY=([^;]+)/)?.[1] || "");
+    if (provided !== SANDBOX_PASSWORD) {
+      const wrong = req.query.key && req.query.key !== SANDBOX_PASSWORD;
+      return res.status(401).send(`<!doctype html><html><head><title>Aria Chat Sandbox</title><meta name="robots" content="noindex,nofollow"></head><body style="font-family:-apple-system,sans-serif;max-width:380px;margin:120px auto;padding:24px"><h3 style="color:#1F3A5F">Aria Chat Sandbox</h3>${wrong ? '<p style="color:#c33;font-size:14px">Wrong password.</p>' : ''}<form method="get" action="/sandbox/aria"><input name="key" type="password" placeholder="Sandbox password" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:14px;margin-bottom:8px" autofocus><button type="submit" style="width:100%;padding:10px;background:#1F3A5F;color:white;border:0;border-radius:6px;font-size:14px;cursor:pointer">Enter</button></form></body></html>`);
+    }
+    res.setHeader("Set-Cookie", `SANDBOX_KEY=${SANDBOX_PASSWORD}; Path=/sandbox; Max-Age=${30*24*60*60}; SameSite=Lax`);
+  }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(renderChatAriaSandboxPage());
+});
+
 app.get("/sandbox", (req, res) => {
   // Optional password gate: if SANDBOX_PASSWORD env is set, require ?key=PASSWORD
   // OR a SANDBOX_KEY cookie. Simple gate — designed to keep casual link-leaks
@@ -2488,6 +2617,7 @@ async function start() {
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);
       console.log(`   POST /webhooks/econowind  - EconoWind lead notification routing`);
       console.log(`   POST /sendsteps-chat/book-demo - Chat-Aria book_demo tool endpoint`);
+      console.log(`   GET  /sandbox/aria        - Chat-Aria sandbox page`);
       console.log(`   POST /notify              - Send email notification`);
       console.log(`   GET  /health              - Health check`);
       console.log(`   GET  /stats               - Event statistics`);

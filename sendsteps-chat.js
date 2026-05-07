@@ -111,64 +111,35 @@ function mapRetellToSendstepsChat(flatAnalysis, transcript, callId) {
   };
 }
 
-// ─── Create Zoho lead via REST API ──────────────────────────────────────────
-async function createZohoLead(payload, routingKey, deps) {
-  const { getZohoAccessToken } = deps;
-  const token = await getZohoAccessToken();
-  const mgr = SALES_MANAGERS[routingKey];
-
+// ─── Build a prefilled Zoho CreateLead URL for the alert email ──────────────
+// V1 approach: skip auto-create. Sales managers click the button in the email
+// → Zoho opens with all fields pre-filled → they review + save in ~20s.
+// This avoids needing the ZohoCRM.modules.leads.CREATE OAuth scope.
+function buildZohoCreateLeadUrl(payload) {
   const nameParts = (payload.visitor_name || "").trim().split(/\s+/);
-  const firstName = nameParts[0] || "Unknown";
+  const firstName = nameParts[0] || "";
   const lastName  = nameParts.slice(1).join(" ") || "—";
 
-  // NOTE: Rating field intentionally NOT written.
-  // Sendsteps Rating picklist is purchase-intent (1. gives all signals to purchase, etc.)
-  // — overloading would mix concepts. Tier classification lives in Aria_Notes block instead.
-  const leadData = {
-    Email: payload.visitor_email,
+  const params = {
+    Email: payload.visitor_email || "",
     First_Name: firstName,
     Last_Name: lastName,
-    Company: payload.institution_name_inferred || "Unknown Institution",
-    Educational_Institute: payload.institution_name_inferred || "",
+    Company: payload.institution_name_inferred || "",
     Country: payload.institution_country_inferred || "",
-    Lead_Source: "Sendsteps Chat — Aria",   // requires new picklist value in Zoho
+    Lead_Source: "Sendsteps Chat — Aria",
     Language: "English",
-    Score: payload.predicted_pql_signal || 0,
+    Score: String(payload.predicted_pql_signal || 0),
     Aria_Status: mapOutcomeToAriaStatus(payload.outcome, payload.predicted_tier),
     Aria_Notes: buildAriaNotes(payload),
     Description: payload.conversation_summary || "",
   };
 
-  // Set Owner if env var is configured
-  const ownerId = process.env[mgr.zohoOwnerIdEnv];
-  if (ownerId) leadData.Owner = { id: ownerId };
+  const qs = Object.entries(params)
+    .filter(([, v]) => v !== "" && v !== null && v !== undefined)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
 
-  // Set Signup_role_type only if it's a known Zoho-friendly value
-  if (payload.role_inferred && payload.role_inferred !== "unknown") {
-    leadData.Signup_role_type = payload.role_inferred;
-  }
-
-  const resp = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Zoho-oauthtoken ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      data: [leadData],
-      trigger: ["approval", "workflow", "blueprint"],
-    }),
-  });
-
-  const body = await resp.json();
-  if (!resp.ok) {
-    throw new Error(`Zoho lead create failed: HTTP ${resp.status} ${JSON.stringify(body)}`);
-  }
-  const result = body.data && body.data[0];
-  if (!result || result.code !== "SUCCESS") {
-    throw new Error(`Zoho lead create returned non-SUCCESS: ${JSON.stringify(result)}`);
-  }
-  return result.details.id;
+  return `https://crm.zoho.eu/crm/CreateLead?${qs}`;
 }
 
 // ─── Email template (Resend HTML) ───────────────────────────────────────────
@@ -179,15 +150,13 @@ const TIER_COLORS = {
   "4": { bg: "#7F7F7F", label: "TIER 4 — OUTBOUND QUEUE" },
 };
 
-function buildAlertEmailHtml(payload, mgr, zohoLeadId) {
+function buildAlertEmailHtml(payload, mgr) {
   const tier = String(payload.predicted_tier || "4");
   const tc = TIER_COLORS[tier] || TIER_COLORS["4"];
   const calendlyBlock = payload.calendly_event_uri
     ? `<p style="margin:0 0 14px 0;font-size:14px;"><strong>Calendly event:</strong> <a href="${payload.calendly_event_uri}" style="color:#1F3A5F;">${payload.calendly_event_uri}</a></p>`
     : "";
-  const zohoUrl = zohoLeadId
-    ? `https://crm.zoho.eu/crm/tab/Leads/${zohoLeadId}`
-    : "#";
+  const createLeadUrl = buildZohoCreateLeadUrl(payload);
 
   return `<!DOCTYPE html>
 <html><body style="margin:0;padding:0;background:#F5F5F5;font-family:Arial,Helvetica,sans-serif;color:#333;">
@@ -217,11 +186,14 @@ function buildAlertEmailHtml(payload, mgr, zohoLeadId) {
 <p style="margin:0;padding:14px 16px;background:#F8F9FA;border-left:4px solid ${tc.bg};font-size:14px;line-height:1.5;border-radius:4px;">${escapeHtml(payload.conversation_summary || "(no summary)")}</p>
 </td></tr>
 <tr><td style="padding:0 30px 20px 30px;">${calendlyBlock}</td></tr>
-<tr><td style="padding:0 30px 30px 30px;">
-<a href="${zohoUrl}" style="display:inline-block;background:#1F3A5F;color:#FFF;padding:12px 24px;text-decoration:none;border-radius:6px;font-size:14px;font-weight:bold;margin-right:8px;">View in Zoho</a>
-<a href="mailto:${escapeHtml(payload.visitor_email)}" style="display:inline-block;background:#FFF;color:#1F3A5F;padding:12px 24px;text-decoration:none;border:2px solid #1F3A5F;border-radius:6px;font-size:14px;font-weight:bold;">Email visitor</a>
+<tr><td style="padding:0 30px 8px 30px;">
+<a href="${createLeadUrl}" style="display:inline-block;background:#1F3A5F;color:#FFF;padding:14px 28px;text-decoration:none;border-radius:6px;font-size:15px;font-weight:bold;margin-right:8px;margin-bottom:8px;">Create lead in Zoho →</a>
+<a href="mailto:${escapeHtml(payload.visitor_email)}" style="display:inline-block;background:#FFF;color:#1F3A5F;padding:14px 28px;text-decoration:none;border:2px solid #1F3A5F;border-radius:6px;font-size:15px;font-weight:bold;margin-bottom:8px;">Email visitor</a>
 </td></tr>
-<tr><td style="padding:20px 30px;background:#F8F9FA;border-top:1px solid #E0E0E0;font-size:12px;color:#999;">Chat-Aria V1 &middot; Zoho lead ${zohoLeadId || "—"} &middot; Sendsteps</td></tr>
+<tr><td style="padding:0 30px 24px 30px;font-size:12px;color:#999;line-height:1.5;">
+The "Create lead in Zoho" button opens Zoho with all fields pre-filled (visitor details, institution, tier, PQL score, conversation summary). Review and click <strong>Save</strong> to log it in CRM.
+</td></tr>
+<tr><td style="padding:20px 30px;background:#F8F9FA;border-top:1px solid #E0E0E0;font-size:12px;color:#999;">Chat-Aria V1 &middot; Sendsteps</td></tr>
 </table>
 </td></tr></table></body></html>`;
 }
@@ -234,6 +206,10 @@ function escapeHtml(s) {
 }
 
 // ─── Main lead processing ───────────────────────────────────────────────────
+// V1: NO auto-create in Zoho. Email alert contains a prefilled "Create lead in
+// Zoho" button — sales manager reviews + saves manually (~20 sec). Avoids the
+// ZohoCRM.modules.leads.CREATE OAuth scope requirement. All chat data is still
+// preserved in the retell_events Postgres table for back-fill if needed.
 async function processSendstepsChat(payload, deps) {
   const { sendEmail, NOTIFY_FROM } = deps;
   const routingKey = routeByCountry(payload.institution_country_inferred);
@@ -241,31 +217,21 @@ async function processSendstepsChat(payload, deps) {
 
   console.log(`  [SS-CHAT] Lead: ${payload.visitor_email} | ${payload.institution_name_inferred || "Unknown Inst"} | Tier ${payload.predicted_tier} | → ${mgr.name}`);
 
-  // 1. Create Zoho lead
-  let zohoLeadId = null;
-  try {
-    zohoLeadId = await createZohoLead(payload, routingKey, deps);
-    console.log(`  [SS-CHAT] Zoho lead created: ${zohoLeadId}`);
-  } catch (err) {
-    console.error(`  [ERR] Zoho lead create failed:`, err.message);
-    // Don't throw — continue to email so the lead at least gets surfaced
-  }
-
-  // 2. Send email alert (skip Tier 4 — voice-Aria handles outbound)
+  // Send email alert (skip Tier 4 — voice-Aria handles those via outbound)
   const tier = String(payload.predicted_tier || "4");
   if (tier === "4") {
-    console.log(`  [SS-CHAT] Tier 4 → no email alert (queued for voice-Aria via Aria_Status)`);
-    return { zohoLeadId, routedTo: routingKey, tier, email: "skipped_tier4" };
+    console.log(`  [SS-CHAT] Tier 4 → no email alert (queued for voice-Aria outbound)`);
+    return { routedTo: routingKey, tier, email: "skipped_tier4" };
   }
 
   if (!sendEmail) {
     console.warn(`  [WARN] sendEmail not provided — cannot send Tier ${tier} alert`);
-    return { zohoLeadId, routedTo: routingKey, tier, email: "not_configured" };
+    return { routedTo: routingKey, tier, email: "not_configured" };
   }
 
   const subject = `[Tier ${tier}] New Sendsteps Chat Lead: ${payload.institution_name_inferred || payload.visitor_name || "Unknown"}`;
-  const html = buildAlertEmailHtml(payload, mgr, zohoLeadId);
-  const text = `Tier ${tier} - New Sendsteps Chat Lead\n\nInstitution: ${payload.institution_name_inferred}\nVisitor: ${payload.visitor_name} (${payload.visitor_email})\nRole: ${payload.role_inferred}\nOutcome: ${payload.outcome}\nRouted to: ${mgr.name}\n\nSummary: ${payload.conversation_summary}`;
+  const html = buildAlertEmailHtml(payload, mgr);
+  const text = `Tier ${tier} - New Sendsteps Chat Lead\n\nInstitution: ${payload.institution_name_inferred}\nVisitor: ${payload.visitor_name} (${payload.visitor_email})\nRole: ${payload.role_inferred}\nOutcome: ${payload.outcome}\nRouted to: ${mgr.name}\n\nSummary: ${payload.conversation_summary}\n\nCreate lead in Zoho: ${buildZohoCreateLeadUrl(payload)}`;
 
   try {
     await sendEmail({
@@ -276,10 +242,10 @@ async function processSendstepsChat(payload, deps) {
       html,
     });
     console.log(`  [SS-CHAT] Alert email sent to ${mgr.email}`);
-    return { zohoLeadId, routedTo: routingKey, tier, email: "sent" };
+    return { routedTo: routingKey, tier, email: "sent" };
   } catch (err) {
     console.error(`  [ERR] Email send failed:`, err.message);
-    return { zohoLeadId, routedTo: routingKey, tier, email: "failed", error: err.message };
+    return { routedTo: routingKey, tier, email: "failed", error: err.message };
   }
 }
 
@@ -357,3 +323,4 @@ module.exports = {
   mapOutcomeToAriaStatus,
   SALES_MANAGERS,
 };
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    

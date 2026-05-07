@@ -7,6 +7,7 @@ const scorer = require("./interaction-scorer");
 const odooProxy = require("./odoo-proxy");
 const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 const analyst = require("./intelligence-analyst");
+const sendsteps = require("./sendsteps-chat");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -1194,6 +1195,7 @@ app.post("/webhooks/retell", async (req, res) => {
       agent_aa56b68b02f6de4ac5725a829b: "Aria EN (Sendsteps)",
       agent_e1e1f763101db5abe0df281891: "Aria NL (Sendsteps)",
       agent_760482429951f50e816c47b55a: "EconoWind Chat",
+      agent_4edb3c94541c725dd1c5c344de: "Aria Chat EN (Sendsteps)",
     };
     const agentLabel = agentNames[agentId] || agentId || "unknown";
 
@@ -1241,6 +1243,40 @@ app.post("/webhooks/retell", async (req, res) => {
           `INSERT INTO notifications (subject, body, priority, source, status, error)
            VALUES ($1, $2, $3, 'econowind_ventobot_auto', 'failed', $4)`,
           [`Auto-routing failed for chat ${callId}`, ewErr.message, "unknown", ewErr.message]
+        ).catch(() => {});
+      }
+    }
+
+    // ─── Chat-Aria (Sendsteps registration) auto-routing ─────────────────
+    // Chat-Aria EN agent emits chat_analyzed when post-chat analysis completes.
+    // We extract the structured payload, create a Zoho lead, and email the routed
+    // sales manager. Tier 4 leads get Aria_Status="Ready for Aria EN" so the
+    // existing voice-Aria dispatch flow picks them up for outbound.
+    if (agentId === sendsteps.CHAT_ARIA_AGENT_ID && isAnalyzedEvent && callAnalysis) {
+      console.log(`  [SS-CHAT] Chat-Aria EN ${eventType} — processing lead...`);
+      try {
+        const flatAnalysis = {
+          ...(callAnalysis.custom_analysis_data || {}),
+          chat_summary: callAnalysis.chat_summary,
+          user_sentiment: callAnalysis.user_sentiment,
+          chat_successful: callAnalysis.chat_successful,
+        };
+        const ssLead = sendsteps.mapRetellToSendstepsChat(flatAnalysis, transcript, callId);
+        if (ssLead) {
+          await sendsteps.processSendstepsChat(ssLead, {
+            getZohoAccessToken,
+            sendEmail,
+            NOTIFY_FROM,
+          });
+        } else {
+          console.log(`  [SS-CHAT] No actionable lead data (no email captured) — skipping.`);
+        }
+      } catch (ssErr) {
+        console.error(`  [ERR] Chat-Aria auto-routing failed:`, ssErr.message);
+        await pool.query(
+          `INSERT INTO notifications (subject, body, priority, source, status, error)
+           VALUES ($1, $2, $3, 'sendsteps_chat_aria_auto', 'failed', $4)`,
+          [`Chat-Aria routing failed for chat ${callId}`, ssErr.message, "unknown", ssErr.message]
         ).catch(() => {});
       }
     }
@@ -1811,6 +1847,9 @@ analyst.registerAnalystRoutes(app, { pool, sendEmail, requireAuth });
 
 // ─── Odoo CRM Proxy (pipeline monitoring for Paperclip agents) ──────────────
 odooProxy.registerRoutes(app, pool);
+
+// ─── Chat-Aria (Sendsteps) — book_demo tool endpoint ────────────────────────
+sendsteps.registerRoutes(app, { sendEmail, NOTIFY_FROM, NOTIFY_SECRET });
 
 // ─── Zoho CRM → Aria Pipeline Endpoint ──────────────────────────────────────
 
@@ -2448,6 +2487,7 @@ async function start() {
       console.log(`Retell Webhook Receiver v1.7.0 listening on port ${PORT}`);
       console.log(`   POST /webhooks/retell     - Retell webhook ingestion`);
       console.log(`   POST /webhooks/econowind  - EconoWind lead notification routing`);
+      console.log(`   POST /sendsteps-chat/book-demo - Chat-Aria book_demo tool endpoint`);
       console.log(`   POST /notify              - Send email notification`);
       console.log(`   GET  /health              - Health check`);
       console.log(`   GET  /stats               - Event statistics`);
@@ -2472,6 +2512,7 @@ async function start() {
       console.log(`   • Aria EN (Sendsteps):  agent_aa56b68b02f6de4ac5725a829b`);
       console.log(`   • Aria NL (Sendsteps):  agent_e1e1f763101db5abe0df281891`);
       console.log(`   • EconoWind Chat:       agent_760482429951f50e816c47b55a`);
+      console.log(`   • Aria Chat EN:         agent_4edb3c94541c725dd1c5c344de`);
       if (RETELL_WEBHOOK_SECRET) {
         console.log(`\n   [OK] Webhook signature verification ENABLED`);
       } else {

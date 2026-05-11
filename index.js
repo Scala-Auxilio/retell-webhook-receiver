@@ -1218,16 +1218,27 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     // Hung up early or no answer — treat identically: increment attempt count, schedule retry
     const currentCount = await fetchAttemptCount(zohoLeadId, prospectEmail);
     const newCount = currentCount + 1;
-    ariaStatus = ATTEMPT_STATUS_MAP[newCount] || "Max Attempts - Nurture";
 
-    const retryDate = new Date();
-    retryDate.setDate(retryDate.getDate() + Math.min(newCount, 3));
-
-    extraFields = {
-      Aria_Attempt_Count:   newCount,
-      Aria_Next_Retry_Date: retryDate.toISOString().split("T")[0], // YYYY-MM-DD
-      Aria_Callback_Time:   "09:00",
-    };
+    // 3-attempt cap (per rubric design 2026-05-05). After the 3rd attempt
+    // the lead is parked at Max Attempts - Nurture with no retry date so it
+    // doesn\'t become a zombie waiting for a retry the retry-tick refuses to fire.
+    if (newCount >= 3) {
+      ariaStatus = "Max Attempts - Nurture";
+      extraFields = {
+        Aria_Attempt_Count:   newCount,
+        Aria_Next_Retry_Date: null,
+        Aria_Callback_Time:   null,
+      };
+    } else {
+      ariaStatus = ATTEMPT_STATUS_MAP[newCount];
+      const retryDate = new Date();
+      retryDate.setDate(retryDate.getDate() + newCount);
+      extraFields = {
+        Aria_Attempt_Count:   newCount,
+        Aria_Next_Retry_Date: retryDate.toISOString().split("T")[0], // YYYY-MM-DD
+        Aria_Callback_Time:   "09:00",
+      };
+    }
     console.log(`  [ARIA] No-answer flow | attempt: ${newCount} | status: ${ariaStatus} | retry: ${extraFields.Aria_Next_Retry_Date}`);
   } else {
     ariaStatus = DISPOSITION_TO_ARIA_STATUS[disposition] || "Failed";
@@ -2223,6 +2234,21 @@ app.post("/zoho/echo", requireAuth, async (req, res) => {
 app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   const zohoLead = req.body;
 
+  // ─── Business-hours gate (defence in depth) ──────────────────────────────
+  // Even if Zoho Flow fires off-hours, the receiver refuses to dial outside
+  // Mon-Fri 09:00-17:00 CET. Lead stays in its current Aria_Status; will be
+  // picked up by the next status change or the weekday cron.
+  if (!isBusinessHours()) {
+    const cetNow = new Date().toLocaleString("en-US", { timeZone: "Europe/Amsterdam" });
+    console.warn(`[ARIA-TRIGGER] Outside business hours (Mon-Fri 09:00-17:00 CET, now=${cetNow}) — skipping dial. Lead: ${zohoLead.Email || zohoLead.email || "?"}`);
+    return res.json({
+      skipped: true,
+      reason: "outside_business_hours",
+      window: "Mon-Fri 09:00-17:00 CET",
+      current_time_cet: cetNow,
+    });
+  }
+
   // Temporary diagnostic: capture raw Zoho Flow payload in DB for inspection
   const idKeys = Object.keys(zohoLead).filter(k => /id/i.test(k));
   console.log(`  [ZOHO-DIAG] Raw payload keys: ${Object.keys(zohoLead).join(", ")}`);
@@ -2588,7 +2614,7 @@ function scheduleRetryTickCron() {
     return;
   }
   cron.schedule(
-    "0 9 * * *",
+    "0 9 * * 1-5",  // Mon-Fri only — no weekend dialing of UK university lines
     async () => {
       const startedAt = new Date().toISOString();
       console.log(`[CRON] Running Aria retry tick (started ${startedAt})`);

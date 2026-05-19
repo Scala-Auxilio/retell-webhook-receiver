@@ -161,19 +161,24 @@ async function initDatabase() {
     console.log("Database table notifications ready.");
 
     // Bunker price cache table — populated by daily cron from shipandbunker.com
-    CREATE TABLE IF NOT EXISTS bunker_prices (
-      id SERIAL PRIMARY KEY,
-      fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      port VARCHAR(64) NOT NULL,
-      grade VARCHAR(32) NOT NULL,
-      usd_per_mt NUMERIC(8,2) NOT NULL,
-      source VARCHAR(64) NOT NULL,
-      status VARCHAR(16) DEFAULT 'ok'
-    );
-    CREATE INDEX IF NOT EXISTS idx_bunker_prices_fetched
-      ON bunker_prices (port, grade, fetched_at DESC);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bunker_prices (
+        id          SERIAL PRIMARY KEY,
+        fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        port        VARCHAR(64) NOT NULL,
+        grade       VARCHAR(32) NOT NULL,
+        usd_per_mt  NUMERIC(8,2) NOT NULL,
+        source      VARCHAR(64) NOT NULL,
+        status      VARCHAR(16) DEFAULT 'ok'
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_bunker_prices_fetched
+        ON bunker_prices (port, grade, fetched_at DESC);
+    `);
+    console.log("Database table bunker_prices ready.");
 
-    // // EconoWind leads table
+    // EconoWind leads table
     await client.query(`
       CREATE TABLE IF NOT EXISTS econowind_leads (
         id                SERIAL PRIMARY KEY,

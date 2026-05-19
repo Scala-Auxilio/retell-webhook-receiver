@@ -160,7 +160,20 @@ async function initDatabase() {
     console.log("Database table retell_events ready with indexes.");
     console.log("Database table notifications ready.");
 
-    // EconoWind leads table
+    // Bunker price cache table — populated by daily cron from shipandbunker.com
+    CREATE TABLE IF NOT EXISTS bunker_prices (
+      id SERIAL PRIMARY KEY,
+      fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      port VARCHAR(64) NOT NULL,
+      grade VARCHAR(32) NOT NULL,
+      usd_per_mt NUMERIC(8,2) NOT NULL,
+      source VARCHAR(64) NOT NULL,
+      status VARCHAR(16) DEFAULT 'ok'
+    );
+    CREATE INDEX IF NOT EXISTS idx_bunker_prices_fetched
+      ON bunker_prices (port, grade, fetched_at DESC);
+
+    // // EconoWind leads table
     await client.query(`
       CREATE TABLE IF NOT EXISTS econowind_leads (
         id                SERIAL PRIMARY KEY,
@@ -355,7 +368,7 @@ const FUEL_WIND_AMPLIFICATION = 2;
 const FUEL_UNCERTAINTY_PP = 5;
 const FUEL_CO2_FACTOR = 3.146; // standard marine fuel
 const FUEL_USD_TO_EUR = 0.92;
-const FUEL_DEFAULT_PRICE_USD = 600;
+const FUEL_DEFAULT_PRICE_USD = parseFloat(process.env.FUEL_DEFAULT_PRICE_USD) || 800;
 
 function normalizeShipType(input) {
   if (!input) return null;
@@ -1498,6 +1511,106 @@ app.post("/webhooks/retell", async (req, res) => {
 });
 
 
+
+// ─── Bunker price cache (Rotterdam VLSFO from shipandbunker.com) ────────────
+// Cron fetches once daily at 09:00 UTC and caches in bunker_prices table.
+// /api/fuel-savings reads the latest cached row as the default fuel price.
+// If fetch fails or DB stale (>7 days), falls back to FUEL_DEFAULT_PRICE_USD.
+async function fetchBunkerPrice() {
+  try {
+    const url = "https://shipandbunker.com/prices";
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; EconoWindBunkerFetcher/1.0; +https://econowind.nl)",
+        "Accept": "text/html,application/xhtml+xml"
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    // Parse Rotterdam VLSFO price — looking for the pattern "Rotterdam <whitespace/html> NUM.NN"
+    const match = html.match(/Rotterdam[^\d]+?(\d{3,4}\.\d{2})/);
+    if (!match) throw new Error("Rotterdam VLSFO price not found in Ship & Bunker page");
+    const usd = parseFloat(match[1]);
+    if (!Number.isFinite(usd) || usd < 200 || usd > 3000) {
+      throw new Error(`Parsed bunker price out of sanity range: ${usd}`);
+    }
+    await pool.query(
+      `INSERT INTO bunker_prices (port, grade, usd_per_mt, source, status)
+       VALUES ($1, $2, $3, $4, 'ok')`,
+      ['Rotterdam', 'VLSFO', usd, 'shipandbunker.com']
+    );
+    console.log(`[BUNKER] Fetched Rotterdam VLSFO: $${usd}/MT`);
+    return usd;
+  } catch (err) {
+    console.error(`[BUNKER] Fetch failed: ${err.message}`);
+    pool.query(
+      `INSERT INTO notifications (subject, body, priority, source, status, error)
+       VALUES ($1, $2, $3, 'bunker_price_fetch', 'failed', $4)`,
+      ['Bunker price fetch failed', err.message, 'low', err.message]
+    ).catch(() => {});
+    return null;
+  }
+}
+
+async function getLatestBunkerPrice() {
+  try {
+    const result = await pool.query(
+      `SELECT usd_per_mt, fetched_at FROM bunker_prices
+       WHERE port = 'Rotterdam' AND grade = 'VLSFO' AND status = 'ok'
+       ORDER BY fetched_at DESC LIMIT 1`
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    const ageDays = (Date.now() - new Date(row.fetched_at).getTime()) / 86400000;
+    return {
+      price: parseFloat(row.usd_per_mt),
+      fetched_at: row.fetched_at,
+      age_days: ageDays,
+      stale: ageDays > 7,
+    };
+  } catch (err) {
+    console.error("[BUNKER] DB lookup failed:", err.message);
+    return null;
+  }
+}
+
+// Schedule daily refresh at 09:00 UTC and trigger once at startup
+function scheduleBunkerPriceCron() {
+  if (process.env.BUNKER_PRICE_CRON === "off") {
+    console.log("[CRON] Bunker price fetch DISABLED via BUNKER_PRICE_CRON=off");
+    return;
+  }
+  cron.schedule("0 9 * * *", fetchBunkerPrice, { timezone: "UTC" });
+  console.log("[CRON] Bunker price daily refresh scheduled @ 09:00 UTC");
+  // Initial fetch 10 seconds after startup so we have a price right away on first deploy
+  setTimeout(() => {
+    getLatestBunkerPrice().then(b => {
+      if (!b || b.age_days > 1) {
+        console.log("[BUNKER] No recent cache, running initial fetch...");
+        fetchBunkerPrice();
+      } else {
+        console.log(`[BUNKER] Recent cache present (age ${b.age_days.toFixed(1)} days, $${b.price}/MT)`);
+      }
+    });
+  }, 10000);
+}
+
+// Debug / monitoring endpoint
+app.get("/bunker-price", async (_req, res) => {
+  const b = await getLatestBunkerPrice();
+  if (!b) return res.status(404).json({ error: "no cached bunker price" });
+  res.json({
+    port: "Rotterdam",
+    grade: "VLSFO",
+    usd_per_mt: b.price,
+    fetched_at: b.fetched_at,
+    age_days: Number(b.age_days.toFixed(2)),
+    stale: b.stale,
+    source: "shipandbunker.com",
+  });
+});
+
 // ─── EconoWind Fuel Savings API (called by VentoBot custom function) ────────
 // Returns vessel-specific savings estimates derived from the internal sizing
 // model. Auth-gated so only the Retell custom function (with NOTIFY_SECRET
@@ -1505,14 +1618,44 @@ app.post("/webhooks/retell", async (req, res) => {
 // values are never exposed.
 app.post("/api/fuel-savings", requireAuth, async (req, res) => {
   try {
-    // Retell custom-function POSTs wrap arguments as {name, call, args} by default.
-    // Accept both that shape and a flat top-level body so the endpoint also works
-    // for direct API calls and for "Payload: args only" mode.
     const body = req.body || {};
     const args = (body && typeof body === "object" && body.args && typeof body.args === "object")
       ? body.args
       : body;
-    const out = calculateFuelSavings(args);
+
+    // Resolve fuel price: visitor-provided > cached bunker > env-var default
+    let resolvedPrice = Number(args.fuel_price_usd);
+    let priceSource = "visitor_provided";
+    let priceFetchedAt = null;
+    if (!Number.isFinite(resolvedPrice) || resolvedPrice <= 0) {
+      const bunker = await getLatestBunkerPrice();
+      if (bunker && !bunker.stale) {
+        resolvedPrice = bunker.price;
+        priceSource = "shipandbunker_rotterdam_vlsfo";
+        priceFetchedAt = bunker.fetched_at;
+      } else {
+        resolvedPrice = FUEL_DEFAULT_PRICE_USD;
+        priceSource = "env_default";
+      }
+    }
+    const out = calculateFuelSavings({ ...args, fuel_price_usd: resolvedPrice });
+    // Override the eur_text to include the source explicitly so the bot can quote it
+    if (out.annual_cost_saved_eur_text) {
+      const dateStr = priceFetchedAt
+        ? new Date(priceFetchedAt).toISOString().slice(0, 10)
+        : null;
+      const sourceLabel = priceSource === "visitor_provided"
+        ? `${resolvedPrice} USD/tonne (your provided rate)`
+        : priceSource === "shipandbunker_rotterdam_vlsfo"
+        ? `${resolvedPrice} USD/tonne — Rotterdam VLSFO from Ship & Bunker, ${dateStr}`
+        : `${resolvedPrice} USD/tonne (internal default)`;
+      out.annual_cost_saved_eur_text = `~€${out.annual_cost_saved_eur.toLocaleString("en-EU")} per year at ${sourceLabel}. If your actual bunker rate differs, the EUR figure scales — share your rate and I'll recompute.`;
+    }
+    out.fuel_price_used = {
+      usd_per_mt: resolvedPrice,
+      source: priceSource,
+      fetched_at: priceFetchedAt,
+    };
     res.json(out);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -2636,6 +2779,7 @@ async function start() {
     await initDatabase();
     await analyst.initAnalystTables(pool);
     scheduleRetryTickCron();
+  scheduleBunkerPriceCron();
     scheduleScorerSweepCron();
     scheduleAnalystCrons();
     app.listen(PORT, "0.0.0.0", () => {

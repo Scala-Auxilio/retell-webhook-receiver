@@ -530,7 +530,6 @@ function renderSandboxPage() {
   type="module"
   data-public-key="${RETELL_PUBLIC_KEY}"
   data-agent-id="${SANDBOX_AGENT_ID}"
-  data-agent-version="0"
   data-title="Chat with EconoWind"
   data-color="#00c48c"
   data-bot-name="VentoBot"

@@ -423,20 +423,55 @@ function calculateFuelSavings(args) {
     methodology_disclaimer: "Estimate based on EconoWind's internal sizing model; vessel-specific calibration happens before any quote.",
   };
 
-  const annual_fuel_mt = Number(args.annual_fuel_mt);
-  if (Number.isFinite(annual_fuel_mt) && annual_fuel_mt > 0) {
-    const fuel_price_usd = Number(args.fuel_price_usd) || FUEL_DEFAULT_PRICE_USD;
-    const fuel_saved = annual_fuel_mt * central_ratio;
-    const cost_usd = fuel_saved * fuel_price_usd;
-    const cost_eur = cost_usd * FUEL_USD_TO_EUR;
-    out.annual_fuel_saved_tonnes = Math.round(fuel_saved);
-    out.annual_cost_saved_eur = Math.round(cost_eur);
-    out.annual_cost_saved_eur_text = `~€${Math.round(cost_eur).toLocaleString("en-EU")} per year (approximate; based on ${fuel_price_usd} USD/tonne, EUR rate may vary at quoting time)`;
-    out.annual_co2_saved_tonnes = Math.round(fuel_saved * FUEL_CO2_FACTOR);
-    out.confidence = "with_fuel_consumption";
-  } else {
-    out.note_for_bot = "If the visitor can share annual fuel consumption (tonnes/year), I can also return cost savings in EUR and CO2 reduction.";
-    out.confidence = "percent_only";
+  // ── Low-savings handling ─────────────────────────────────────
+  // If the requested unit count yields a marginal / near-zero central saving,
+  // never surface a 0% figure. Compute the minimum units needed to reach at
+  // least 5% central savings (same model, just more units), capped at a sane max.
+  const FUEL_MIN_PCT_TARGET = 5;
+  const FUEL_MAX_UNITS_SUGGEST = 12;
+  if (central_pct < FUEL_MIN_PCT_TARGET) {
+    out.low_savings_situation = true;
+    out.confidence = "below_target_min_units";
+    const pct_per_unit = units > 0 ? central_pct / units : 0;
+    if (pct_per_unit > 0) {
+      const minU = Math.ceil(FUEL_MIN_PCT_TARGET / pct_per_unit);
+      if (minU <= FUEL_MAX_UNITS_SUGGEST) {
+        const c = pct_per_unit * minU;
+        out.min_units_for_5pct = minU;
+        out.savings_at_min_units = {
+          low: Number(Math.max(0, c - FUEL_UNCERTAINTY_PP).toFixed(1)),
+          central: Number(c.toFixed(1)),
+          high: Number((c + FUEL_UNCERTAINTY_PP).toFixed(1)),
+        };
+        out.low_savings_guidance = `At ${units} unit(s) the saving on this vessel is marginal. Do NOT present a 0% or near-zero figure. Tell the visitor it would take about ${minU} units of the ${seriesKey} to reach at least ~5% fuel savings on this vessel, then offer to connect them with our team.`;
+      } else {
+        out.min_units_for_5pct = null;
+        out.marginal_fit = true;
+        out.low_savings_guidance = `At ${units} unit(s) the saving is marginal, and even a high unit count would not credibly reach 5% on a vessel this size. Do NOT present a 0% figure. Tell the visitor wind-assist looks like a marginal fit for this vessel and offer to connect them with our team to confirm.`;
+      }
+    } else {
+      out.min_units_for_5pct = null;
+      out.marginal_fit = true;
+      out.low_savings_guidance = `The saving on this vessel is marginal. Do NOT present a 0% figure. Tell the visitor wind-assist looks like a marginal fit for this vessel and offer to connect them with our team.`;
+    }
+  }
+
+  if (!out.low_savings_situation) {
+    const annual_fuel_mt = Number(args.annual_fuel_mt);
+    if (Number.isFinite(annual_fuel_mt) && annual_fuel_mt > 0) {
+      const fuel_price_usd = Number(args.fuel_price_usd) || FUEL_DEFAULT_PRICE_USD;
+      const fuel_saved = annual_fuel_mt * central_ratio;
+      const cost_usd = fuel_saved * fuel_price_usd;
+      const cost_eur = cost_usd * FUEL_USD_TO_EUR;
+      out.annual_fuel_saved_tonnes = Math.round(fuel_saved);
+      out.annual_cost_saved_eur = Math.round(cost_eur);
+      out.annual_cost_saved_eur_text = `~€${Math.round(cost_eur).toLocaleString("en-EU")} per year (approximate; based on ${fuel_price_usd} USD/tonne, EUR rate may vary at quoting time)`;
+      out.annual_co2_saved_tonnes = Math.round(fuel_saved * FUEL_CO2_FACTOR);
+      out.confidence = "with_fuel_consumption";
+    } else {
+      out.note_for_bot = "If the visitor can share annual fuel consumption (tonnes/year), I can also return cost savings in EUR and CO2 reduction.";
+      out.confidence = "percent_only";
+    }
   }
   return out;
 }

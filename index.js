@@ -63,6 +63,7 @@ const RETELL_API_BASE   = "https://api.retellai.com";
 const AGENT_ID_TO_LABEL = {
   [AGENTS.aria_en.agent_id]: "Aria EN",
   [AGENTS.aria_nl.agent_id]: "Aria NL",
+  [AGENTS.scout_uk.agent_id]: "Scout UK",
 };
 
 // In-memory token cache (refreshed automatically when expired)
@@ -1167,6 +1168,88 @@ async function fetchAttemptCount(zohoLeadId, prospectEmail) {
 /**
  * Handle an Aria call_ended event: extract disposition and update Zoho CRM directly.
  */
+// ─── Scout (contact-capture) call-end handler ────────────────────────────────
+// Scout's ONLY job is to capture the right contact's email (+ name/role/phone if
+// the gatekeeper offers them). This writes the captured fields to Zoho and sets a
+// Scout outcome status. A captured direct phone is STORED, never auto-dialled
+// (Petrus's decision, 2026-05-22) — the email sequence is the only handoff.
+async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
+  const dynVars = callData.retell_llm_dynamic_variables || {};
+  const zohoLeadId = dynVars.zoho_lead_id || null;
+  const cad = (callAnalysis && callAnalysis.custom_analysis_data) || {};
+
+  const email = String(cad.scout_captured_email || "").trim();
+  const name  = String(cad.scout_captured_name  || "").trim();
+  const role  = String(cad.scout_captured_role  || "").trim();
+  const phone = String(cad.scout_captured_phone || "").trim();
+  let disposition = String(cad.call_outcome || cad.call_disposition || "").trim().toLowerCase();
+
+  // Fallback disposition from the connection state when no analysis is present
+  const reason = (callData.disconnection_reason || "").toLowerCase();
+  if (!disposition) {
+    if (reason.includes("no_answer") || reason.includes("dial_failed") || reason.includes("busy")) disposition = "no_answer";
+    else if (reason.includes("machine") || reason.includes("voicemail")) disposition = "voicemail";
+    else disposition = (email || phone) ? "contact_captured" : "no_contact";
+  }
+  // Any usable email or direct phone always counts as a capture.
+  if (email || phone) disposition = "contact_captured";
+
+  // Map disposition → Aria_Status workflow value
+  let scoutStatus;
+  if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
+  else if (disposition === "no_answer" || disposition === "voicemail") scoutStatus = "Scout - No Answer";
+  else scoutStatus = "Scout - No Contact"; // human reached but nothing given (refused / wrong org)
+
+  const durationSec = Math.round((callData.duration_ms || 0) / 1000);
+  const summary = (callAnalysis && (callAnalysis.call_summary || callAnalysis.summary)) || "";
+  const notes = [
+    summary,
+    email ? `Captured email: ${email}` : null,
+    name  ? `Contact: ${name}` : null,
+    role  ? `Role: ${role}` : null,
+    phone ? `Direct phone (stored, NOT auto-dialled): ${phone}` : null,
+    `Scout disposition: ${disposition}`,
+    `Duration: ${durationSec}s`,
+  ].filter(Boolean).join(". ");
+
+  console.log(`  [SCOUT] ${disposition} | lead: ${zohoLeadId || "(unknown)"} | email: ${email || "—"} | phone: ${phone || "—"}`);
+
+  if (!zohoLeadId) {
+    console.warn(`  [SCOUT] No zoho_lead_id — cannot update CRM. Call: ${callId}`);
+    await pool.query(
+      `INSERT INTO notifications (subject, body, priority, source, status)
+       VALUES ($1, $2, 'high', 'scout_call_ended', 'skipped')`,
+      [`Scout call missing zoho_lead_id: ${callId}`, JSON.stringify({ call_id: callId, custom_analysis_data: cad })]
+    ).catch(() => {});
+    return;
+  }
+
+  // Only write captured fields that we actually have (avoid clearing on empties)
+  const extraFields = {};
+  if (email) extraFields.Scout_Captured_Email = email;
+  if (name)  extraFields.Scout_Captured_Name  = name;
+  if (role)  extraFields.Scout_Captured_Role  = role;
+  if (phone) extraFields.Scout_Captured_Phone = phone;
+
+  const crmResult = await updateZohoCRMLead({
+    zohoLeadId,
+    prospectEmail: "",
+    ariaStatus: scoutStatus,
+    notes,
+    callId,
+    extraFields,
+  });
+
+  await pool.query(
+    `INSERT INTO notifications (subject, body, priority, source, status)
+     VALUES ($1, $2, 'normal', 'scout_call_ended', 'sent')`,
+    [
+      `Scout ${disposition}: ${name || "contact"} (${email || "no email"})`,
+      JSON.stringify({ lead_id: zohoLeadId, record_id: crmResult && crmResult.recordId, disposition, scout_status: scoutStatus, email, name, role, phone, call_id: callId, agent: agentLabel, duration_sec: durationSec }),
+    ]
+  ).catch(() => {});
+}
+
 async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
   const dynVars = callData.retell_llm_dynamic_variables || {};
   // Zoho CRM lead IDs are numeric long integers. If dynVars.zoho_lead_id is
@@ -1451,6 +1534,38 @@ app.post("/webhooks/retell", async (req, res) => {
     //   • call_analyzed: process everything else (user_hangup, agent_hangup,
     //     inactivity, etc.) — this is where the real disposition lives.
     // The two branches are mutually exclusive by event_type, so no double-write.
+    // ─── Scout (contact-capture) call-end → write captured contact to Zoho ──
+    // Same call_ended / call_analyzed bifurcation as Aria. Returns early so Scout
+    // calls do NOT run through Agent A scoring (the rubric is Aria-specific).
+    const SCOUT_AGENT_IDS = ["agent_0d66a2ab3209717eba1170b76a"]; // Scout UK
+    if (SCOUT_AGENT_IDS.includes(agentId)) {
+      const reason = (callData.disconnection_reason || "").toLowerCase();
+      const isNoConnection =
+        reason === "dial_no_answer" || reason === "no_answer" ||
+        reason === "dial_busy" || reason === "line_busy" ||
+        reason === "machine_detected" || reason === "voicemail_reach" ||
+        reason === "dial_failed" || reason === "unknown_error" ||
+        reason.startsWith("error_");
+      const shouldProcess =
+        (eventType === "call_ended" && isNoConnection) ||
+        (eventType === "call_analyzed");
+      if (shouldProcess) {
+        try {
+          await handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt);
+        } catch (scoutErr) {
+          console.error(`  [SCOUT] Zoho CRM update failed:`, scoutErr.message);
+          await pool.query(
+            `INSERT INTO notifications (subject, body, priority, source, status, error)
+             VALUES ($1, $2, $3, 'scout_call_ended', 'failed', $4)`,
+            [`Scout Zoho update failed for call ${callId}`, scoutErr.message, "high", scoutErr.message]
+          ).catch(() => {});
+        }
+      } else {
+        console.log(`  [SCOUT] call_ended for connected call (${reason}) — waiting for call_analyzed`);
+      }
+      return res.json({ ok: true, agent: "scout_uk", call_id: callId, event: eventType, processed: shouldProcess });
+    }
+
     const ARIA_AGENT_IDS = [
       "agent_aa56b68b02f6de4ac5725a829b", // Aria EN
       "agent_e1e1f763101db5abe0df281891", // Aria NL
@@ -2454,7 +2569,7 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   let agentKey = agentFromAriaStatus(ariaStatus);
 
   if (!agentKey) {
-    return res.status(400).json({ error: `Cannot determine agent from Aria_Status: '${ariaStatus}'. Expected 'Ready for Aria EN' or 'Ready for Aria NL'.` });
+    return res.status(400).json({ error: `Cannot determine agent from Aria_Status: '${ariaStatus}'. Expected 'Ready for Aria EN', 'Ready for Aria NL', or 'Ready for Scout'.` });
   }
 
   // UK country override: if the lead is an EN lead AND the prospect's country

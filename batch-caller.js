@@ -37,6 +37,14 @@ const AGENTS = {
     label: "Aria NL (Sendsteps)",
     from_number: process.env.ARIA_NL_FROM_NUMBER || null,
   },
+  // Scout — single-purpose contact-capture agent (captures the right person's
+  // email from university switchboards; no pitch, no booking). Reuses the UK DID
+  // (same caller ID as Aria UK) unless a dedicated SCOUT_UK_FROM_NUMBER is set.
+  scout_uk: {
+    agent_id: "agent_0d66a2ab3209717eba1170b76a",
+    label: "Scout UK (Sendsteps)",
+    from_number: process.env.SCOUT_UK_FROM_NUMBER || process.env.ARIA_EN_UK_FROM_NUMBER || null,
+  },
 };
 
 // CET calling window: Mon–Fri 09:00–17:00
@@ -167,6 +175,8 @@ function agentFromAriaStatus(ariaStatus) {
   // Match "aria en" or status ending in " en" (but not words like "pending")
   if (/\baria[_ ]en\b/.test(s) || s === "ready for aria en" || s === "retry aria en") return "aria_en";
   if (/\baria[_ ]nl\b/.test(s) || s === "ready for aria nl" || s === "retry aria nl") return "aria_nl";
+  // Scout contact-capture agent — triggered by "Ready for Scout" (or "Retry Scout")
+  if (/\bscout\b/.test(s) || s === "ready for scout" || s === "retry scout") return "scout_uk";
   // Fallback: check for isolated "en"/"nl" at end of string (e.g. "Queue EN")
   if (/\ben$/.test(s)) return "aria_en";
   if (/\bnl$/.test(s)) return "aria_nl";

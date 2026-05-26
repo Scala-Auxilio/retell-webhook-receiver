@@ -974,7 +974,7 @@ async function getZohoAccessToken() {
  * Update a Zoho CRM Lead with the Aria call outcome.
  * Resolves the record by zohoLeadId first; falls back to email search.
  */
-async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes, callId, extraFields = {} }) {
+async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes, callId, extraFields = {}, writeAriaNarrative = true }) {
   const token = await getZohoAccessToken();
   const headers = {
     Authorization: `Zoho-oauthtoken ${token}`,
@@ -1005,16 +1005,24 @@ async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes,
     throw new Error(`Cannot update Zoho CRM: no lead resolved (call: ${callId}, email: ${prospectEmail})`);
   }
 
-  // 2. Update the lead record with Aria fields
-  const updateBody = {
-    data: [{
-      id: recordId,
-      Aria_Status:         ariaStatus,
-      Aria_Notes:          notes,
-      Aria_Last_Call_Date: new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00'),
-      ...extraFields,
-    }],
+  // 2. Update the lead record.
+  //    Aria_Status is always written (it drives routing + downstream Flows).
+  //    Aria_Notes / Aria_Last_Call_Date are only written when writeAriaNarrative
+  //    is true (the default, for Aria). Scout passes writeAriaNarrative:false so it
+  //    does NOT clobber Aria's prior notes/last-call-date — Scout records its own
+  //    leg in Scout_Notes / Scout_Last_Call_Date via extraFields instead.
+  const record = {
+    id: recordId,
+    Aria_Status: ariaStatus,
+    ...(writeAriaNarrative
+      ? {
+          Aria_Notes:          notes,
+          Aria_Last_Call_Date: new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00'),
+        }
+      : {}),
+    ...extraFields,
   };
+  const updateBody = { data: [record] };
   const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
     method: "PUT",
     headers,
@@ -1266,6 +1274,14 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   if (role)  extraFields.Scout_Captured_Role  = role;
   if (phone) extraFields.Scout_Captured_Phone = phone;
 
+  // Scout records its own notes + call date in dedicated Scout_* fields so it does
+  // NOT overwrite Aria's prior notes/last-call-date when a lead is handed Aria → Scout.
+  // (Aria_Attempt_Count is also preserved — Scout never touches it.) The only Aria
+  // field Scout changes is Aria_Status, which is unavoidable: that one picklist drives
+  // both Scout dispatch and the downstream email-sequence Flow.
+  if (notes) extraFields.Scout_Notes = notes;
+  extraFields.Scout_Last_Call_Date = new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00');
+
   const crmResult = await updateZohoCRMLead({
     zohoLeadId,
     prospectEmail: "",
@@ -1273,6 +1289,7 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
     notes,
     callId,
     extraFields,
+    writeAriaNarrative: false, // preserve Aria_Notes / Aria_Last_Call_Date
   });
 
   await pool.query(

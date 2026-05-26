@@ -44,6 +44,14 @@ const AGENTS = {
     agent_id: "agent_0d66a2ab3209717eba1170b76a",
     label: "Scout UK (Sendsteps)",
     from_number: process.env.SCOUT_UK_FROM_NUMBER || process.env.ARIA_EN_UK_FROM_NUMBER || null,
+    // Scout reuses Aria's UK DID, which is bound to the ARIA agent for outbound.
+    // Retell BATCH calls dispatch using the number's bound agent and IGNORE the
+    // payload agent_id — so a batch dispatch on the shared number would run Aria,
+    // not Scout. force_agent_override makes createBatchCall dispatch each task via
+    // single create-phone-call with override_agent_id, which forces the Scout
+    // agent regardless of the number binding. (Remove this once Scout has its own
+    // dedicated DID bound to the Scout agent.)
+    force_agent_override: true,
   },
 };
 
@@ -313,6 +321,43 @@ async function createBatchCall(prospects, options = {}) {
 
   if (!RETELL_API_KEY) {
     throw new Error("RETELL_API_KEY not set. Cannot dispatch calls.");
+  }
+
+  // ── Agent-override dispatch path (e.g. Scout) ──────────────────────────────
+  // When an agent shares another agent's phone number, the Retell BATCH endpoint
+  // would run the number's BOUND agent (it ignores payload.agent_id). To force the
+  // intended agent, dispatch each task via single create-phone-call with
+  // override_agent_id, which the per-call endpoint honours.
+  if (AGENTS[agentKey].force_agent_override) {
+    const callIds = [];
+    for (const task of payload.tasks) {
+      const callResp = await fetch(`${RETELL_API_BASE}/v2/create-phone-call`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${RETELL_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from_number: payload.from_number,
+          to_number: task.to_number,
+          override_agent_id: AGENTS[agentKey].agent_id,
+          retell_llm_dynamic_variables: task.retell_llm_dynamic_variables,
+        }),
+      });
+      if (!callResp.ok) {
+        const err = await callResp.json().catch(() => ({}));
+        throw new Error(`Retell API error ${callResp.status}: ${JSON.stringify(err)}`);
+      }
+      const callData = await callResp.json();
+      callIds.push(callData.call_id || callData.id);
+    }
+    return {
+      success: true,
+      call_ids: callIds,
+      agent: AGENTS[agentKey].label,
+      total_calls: payload.tasks.length,
+      override_agent_id: AGENTS[agentKey].agent_id,
+    };
   }
 
   const resp = await fetch(`${RETELL_API_BASE}/create-batch-call`, {

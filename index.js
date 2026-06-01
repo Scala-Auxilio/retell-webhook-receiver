@@ -2349,7 +2349,9 @@ async function getCurrentNLNumberBinding() {
   const t = setTimeout(() => ctrl.abort(), 8000);
   let resp;
   try {
-    resp = await fetch(`${RETELL_API_BASE}/list-phone-numbers`, {
+    // Use the v2 endpoint — the legacy /list-phone-numbers is deprecated as of
+    // 2026-06-15. The v2 response is `{ items: [...], pagination_key, has_more }`.
+    resp = await fetch(`${RETELL_API_BASE}/v2/list-phone-numbers`, {
       method: "GET",
       headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
       signal: ctrl.signal,
@@ -2357,10 +2359,14 @@ async function getCurrentNLNumberBinding() {
   } finally { clearTimeout(t); }
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`Retell list-phone-numbers ${resp.status}: ${body}`);
+    throw new Error(`Retell v2/list-phone-numbers ${resp.status}: ${body}`);
   }
   const list = await resp.json();
-  const entry = (Array.isArray(list) ? list : []).find(p => p.phone_number === ARIA_NL_DID);
+  // Defensive: prefer the v2 `items` array; fall back to a top-level array if
+  // an older response shape ever sneaks through.
+  const items = (list && Array.isArray(list.items)) ? list.items
+              : (Array.isArray(list) ? list : []);
+  const entry = items.find(p => p.phone_number === ARIA_NL_DID);
   if (!entry) throw new Error(`NL DID ${ARIA_NL_DID} not found in Retell phone list`);
   return {
     phone_number: entry.phone_number,

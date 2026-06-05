@@ -1237,14 +1237,30 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   // Any usable email or direct phone always counts as a capture.
   if (email || phone) disposition = "contact_captured";
 
+  // Detect bad-data patterns BEFORE the status mapping so the lead is moved
+  // out of the Ready-for-Scout queue and not re-dialled:
+  //  - empty transcript + "echo test" / "test line" in the post-call summary
+  //    (number connects to a telecom echo line, not a switchboard)
+  //  - sub-8s voicemail (likely a direct staff line that VMs immediately —
+  //    wrong tool for Scout, which targets switchboards). Conservative.
+  const durationSec = Math.round((callData.duration_ms || 0) / 1000);
+  const summary = (callAnalysis && (callAnalysis.call_summary || callAnalysis.summary)) || "";
+  const transcriptText = String(callData.transcript || "").trim();
+  const isEchoTest = transcriptText.length === 0
+    && /echo test|test line|repeated back the speech|out of service/i.test(summary);
+  const isFastVoicemail = disposition === "voicemail" && durationSec > 0 && durationSec < 8;
+  if (disposition !== "contact_captured" && (isEchoTest || isFastVoicemail)) {
+    console.log(`  [SCOUT] bad-number detected: ${isEchoTest ? "echo/test line" : "sub-8s voicemail"} (${durationSec}s)`);
+    disposition = "bad_number";
+  }
+
   // Map disposition → Aria_Status workflow value
   let scoutStatus;
   if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
+  else if (disposition === "bad_number") scoutStatus = "Scout - Bad Number";
   else if (disposition === "no_answer" || disposition === "voicemail") scoutStatus = "Scout - No Answer";
   else scoutStatus = "Scout - No Contact"; // human reached but nothing given (refused / wrong org)
 
-  const durationSec = Math.round((callData.duration_ms || 0) / 1000);
-  const summary = (callAnalysis && (callAnalysis.call_summary || callAnalysis.summary)) || "";
   const notes = [
     summary,
     email ? `Captured email: ${email}` : null,
@@ -2465,6 +2481,82 @@ app.post("/aria/set-agent", requireAuth, async (req, res) => {
   }
 });
 
+// ─── Scout queue sweep ──────────────────────────────────────────────────────
+// Catches leads flipped to "Ready for Scout" outside business hours: the Zoho
+// Flow only fires on a status change, so when the receiver's business-hours
+// gate rejects an off-hours dispatch the lead sits stuck in "Ready for Scout"
+// forever (no Scout retry path of its own). This sweep finds any such lead and
+// dispatches it. Designed to be invoked daily from the existing retry-tick
+// cron at 09:00 Europe/London — which is inside business hours.
+async function runScoutSweep({ dryRun = false } = {}) {
+  if (!ZOHO_REFRESH_TOKEN) {
+    console.warn("[SCOUT-SWEEP] Zoho not configured — skipping");
+    return { ok: false, error: "no_zoho" };
+  }
+  const token = await getZohoAccessToken();
+  const headers = { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" };
+
+  // The deployed Zoho refresh token doesn't carry COQL scope (see runRetryTick
+  // comment), so we use /Leads/search and filter in JS.
+  const criteria = `(Aria_Status:equals:Ready for Scout)`;
+  const fields = "id,First_Name,Last_Name,Email,Phone,Mobile,Company,Country,Educational_Institute,Lead_Source,Industry,Language,Scout_Last_Call_Date";
+  const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+
+  const qr = await fetch(searchUrl, { headers });
+  if (!qr.ok && qr.status !== 204) {
+    const errText = await qr.text().catch(() => "");
+    throw new Error(`[SCOUT-SWEEP] Lead search failed (${qr.status}): ${errText}`);
+  }
+  const qd = qr.status === 204 ? { data: [] } : await qr.json();
+  const candidates = qd?.data || [];
+
+  // Only stuck ones — Scout_Last_Call_Date null means Scout has never called.
+  const stuck = candidates.filter(l => !l.Scout_Last_Call_Date);
+  console.log(`[SCOUT-SWEEP] candidates=${candidates.length} stuck=${stuck.length} dryRun=${dryRun}`);
+
+  if (dryRun || stuck.length === 0) {
+    return {
+      ok: true, dryRun, count: stuck.length, dispatched: 0, errors: 0,
+      leads: stuck.map(l => ({
+        id: l.id,
+        name: `${l.First_Name||""} ${l.Last_Name||""}`.trim(),
+        university: l.Company || l.Educational_Institute || null,
+      })),
+    };
+  }
+
+  let dispatched = 0, errors = 0;
+  const items = [];
+  for (const zohoLead of stuck) {
+    try {
+      // mapZohoLead expects the Zoho payload shape; lead_id is the standard alias.
+      const leadObj = { ...zohoLead, lead_id: zohoLead.id, Aria_Status: "Ready for Scout" };
+      const prospect = mapZohoLead(leadObj);
+      if (!prospect.zoho_lead_id) prospect.zoho_lead_id = zohoLead.id;
+      const errs = validateProspect(prospect, 1);
+      if (errs.length) {
+        console.warn(`[SCOUT-SWEEP] skip ${zohoLead.id}: ${errs.join("; ")}`);
+        errors++;
+        items.push({ id: zohoLead.id, ok: false, error: errs.join("; ") });
+        continue;
+      }
+      await createBatchCall([prospect], {
+        agent: "scout_uk",
+        dry_run: false,
+        name: `Scout sweep: ${prospect.university_name || "?"} (${zohoLead.id})`,
+      });
+      dispatched++;
+      items.push({ id: zohoLead.id, ok: true, university: prospect.university_name });
+      console.log(`[SCOUT-SWEEP] dispatched ${zohoLead.id} (${prospect.university_name})`);
+    } catch (err) {
+      errors++;
+      items.push({ id: zohoLead.id, ok: false, error: err.message });
+      console.warn(`[SCOUT-SWEEP] dispatch failed for ${zohoLead.id}: ${err.message}`);
+    }
+  }
+  return { ok: true, dryRun, count: stuck.length, dispatched, errors, items };
+}
+
 // POST /aria/retry-tick
 //   Scan Zoho for leads whose Aria_Next_Retry_Date has arrived and flip them
 //   back to "Retry Aria EN" so the existing Zoho Flow re-triggers Aria.
@@ -2479,7 +2571,17 @@ app.post("/aria/retry-tick", requireAuth, async (req, res) => {
   try {
     const dryRun = req.query.dry_run === "1" || req.body?.dry_run === true;
     const result = await runRetryTick({ dryRun });
-    res.json(result);
+    // Also sweep any "Ready for Scout" leads that got stuck because they were
+    // flipped outside business hours. The Scout sweep is non-fatal — its
+    // failures don't surface a 500, but they're logged and returned alongside
+    // the Aria retry result.
+    let scoutSweep;
+    try { scoutSweep = await runScoutSweep({ dryRun }); }
+    catch (err) {
+      console.error("[SCOUT-SWEEP] Error:", err.message);
+      scoutSweep = { ok: false, error: err.message };
+    }
+    res.json({ ...result, scout_sweep: scoutSweep });
   } catch (err) {
     console.error("[RETRY-TICK] Error:", err.message);
     res.status(500).json({ ok: false, error: err.message });

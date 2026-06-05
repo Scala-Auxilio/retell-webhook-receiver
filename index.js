@@ -2686,7 +2686,11 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   const ariaStatus = zohoLead.Aria_Status || zohoLead.aria_status;
 
   if (!ariaStatus) {
-    return res.status(400).json({ error: "Missing Aria_Status field" });
+    // Return 200 (skipped) — a 4xx makes Zoho Flow tick toward the 20-strike
+    // auto-disable for the whole Aria - Dispatch Call flow. We've decided not to
+    // act on this trigger, which is a successful outcome from the webhook's POV.
+    console.warn(`[ZOHO] Skipping: missing Aria_Status field. Keys: ${Object.keys(zohoLead).join(", ")}`);
+    return res.json({ skipped: true, reason: "missing_aria_status" });
   }
 
   // Map Zoho lead to prospect format
@@ -2729,7 +2733,11 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   let agentKey = agentFromAriaStatus(ariaStatus);
 
   if (!agentKey) {
-    return res.status(400).json({ error: `Cannot determine agent from Aria_Status: '${ariaStatus}'. Expected 'Ready for Aria EN', 'Ready for Aria NL', or 'Ready for Scout'.` });
+    // 200 (skipped) — see "missing_aria_status" comment above. We log loudly
+    // so unexpected statuses (e.g. typo or a new picklist value we don't yet
+    // support) surface in the receiver logs, but we don't burn a Flow strike.
+    console.warn(`[ZOHO] Skipping: cannot determine agent from Aria_Status='${ariaStatus}'. Expected starts-with 'Ready for Aria'/'Ready for Scout'/'Retry'.`);
+    return res.json({ skipped: true, reason: "unknown_aria_status", aria_status: ariaStatus });
   }
 
   // UK country override: if the lead is an EN lead AND the prospect's country
@@ -2761,8 +2769,11 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
       if (current.outbound_agent_id !== requiredAgentId) {
         const requiredLabel = AGENT_ID_TO_LABEL[requiredAgentId] || agentKey;
         console.warn(`  [ARIA-FLIP] Dispatch blocked: required ${requiredLabel} but NL DID is bound to ${current.agent_label}`);
-        return res.status(409).json({
-          error: "binding_mismatch",
+        // 200 (skipped) instead of 409 — see "missing_aria_status" comment.
+        // The dispatch is intentionally blocked; this isn't a webhook failure.
+        return res.json({
+          skipped: true,
+          reason: "binding_mismatch",
           required_agent: requiredLabel,
           current_agent: current.agent_label,
           hint: "Call POST /aria/set-agent with { agent: 'EN' | 'NL' } to flip the binding before dispatching.",
@@ -2778,8 +2789,13 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
   // Validate phone number
   const errors = validateProspect(prospect, 1);
   if (errors.length > 0) {
-    console.log(`[ZOHO] Lead ${prospect.zoho_lead_id} rejected: ${errors.join(", ")}`);
-    return res.status(400).json({ error: "Validation failed", details: errors, zoho_lead_id: prospect.zoho_lead_id });
+    // 200 (skipped) instead of 400 — see "missing_aria_status" comment.
+    // Validation rejections (missing/invalid phone) are common with imported
+    // lead data and were ticking the Zoho Flow toward the 20-strike auto-
+    // disable. We log them prominently so they're discoverable, and the lead
+    // sits unchanged in its current Aria_Status for manual cleanup.
+    console.warn(`[ZOHO] Skipping lead ${prospect.zoho_lead_id || "?"}: ${errors.join(", ")}`);
+    return res.json({ skipped: true, reason: "validation_failed", details: errors, zoho_lead_id: prospect.zoho_lead_id });
   }
 
   if (!prospect.zoho_lead_id) {

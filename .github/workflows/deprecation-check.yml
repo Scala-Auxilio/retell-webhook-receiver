@@ -1,0 +1,75 @@
+name: Retell deprecation check
+
+# Fails any push or PR that introduces a reference to a deprecated Retell API
+# endpoint or agent-level field. Added 2026-06-08 after the interaction-scorer
+# was missed in a previous audit and kept hitting /v2/list-calls for a week.
+#
+# If Retell deprecates a new endpoint, add its old path to FORBIDDEN_PATHS below
+# (and migrate the codebase) so we don't drift into the same hole again.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan source for deprecated Retell endpoints
+        run: |
+          set -e
+          # Patterns matching the path as it would appear in a fetch URL or
+          # comparable string. We use word-boundaries / surrounding chars so we
+          # don't false-flag the migrated v2/list-phone-numbers which is the
+          # CURRENT (post-deprecation) endpoint.
+          #
+          # Deprecated as of 2026-06-15:
+          #   POST /v2/list-calls           -> POST /v3/list-calls
+          #   GET  /list-chat               -> POST /v3/list-chats
+          #   GET  /list-phone-numbers      -> GET  /v2/list-phone-numbers
+          #   GET  /list-retell-llms        -> GET  /v2/list-retell-llms
+          #   GET  /list-conversation-flows -> GET  /v2/list-conversation-flows
+          #   GET  /list-conversation-flow-components
+          #   GET  /list-batch-tests        -> GET  /v2/list-batch-tests
+          #   GET  /list-test-case-definitions
+          #   GET  /list-test-runs/{id}
+          # Plus the deprecated agent-config fields:
+          #   analysis_summary_prompt / analysis_successful_prompt / analysis_user_sentiment_prompt
+          PATTERNS=(
+            '/v2/list-calls'
+            '/list-chat\b'
+            '/list-phone-numbers\b'
+            '/list-retell-llms\b'
+            '/list-conversation-flows\b'
+            '/list-conversation-flow-components\b'
+            '/list-batch-tests\b'
+            '/list-test-case-definitions\b'
+            '/list-test-runs/'
+            'analysis_summary_prompt'
+            'analysis_successful_prompt'
+            'analysis_user_sentiment_prompt'
+          )
+          fail=0
+          for pat in "${PATTERNS[@]}"; do
+            # Search JS / JSON / MD / workflow / shell — ignore the workflow itself.
+            matches=$(grep -RInE "$pat" \
+              --include='*.js' --include='*.json' --include='*.md' --include='*.sh' \
+              --exclude-dir=node_modules \
+              --exclude='deprecation-check.yml' \
+              . || true)
+            if [ -n "$matches" ]; then
+              echo "::error::Deprecated Retell pattern \"$pat\" found:"
+              echo "$matches"
+              fail=1
+            fi
+          done
+          if [ "$fail" -eq 1 ]; then
+            echo ""
+            echo "Migration table: https://docs.retellai.com/deprecation-notice/2026/06-15_legacy_list_endpoints"
+            exit 1
+          fi
+          echo "No deprecated Retell endpoints or fields found."

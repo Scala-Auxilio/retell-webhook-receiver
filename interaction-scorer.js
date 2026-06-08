@@ -531,8 +531,10 @@ async function runScorerSweep({ pool, hoursBack = 24, agentIds = ["agent_aa56b68
   if (!RETELL_API_KEY) throw new Error("RETELL_API_KEY not configured");
   const since = Date.now() - hoursBack * 60 * 60 * 1000;
 
-  // Fetch recent Aria calls from Retell
-  const listRes = await fetch("https://api.retellai.com/v2/list-calls", {
+  // Fetch recent Aria calls from Retell. The legacy POST /v2/list-calls was
+  // deprecated on 2026-06-15 — we use /v3/list-calls which returns a paginated
+  // shape: { items: [...], pagination_key, has_more } instead of a top-level array.
+  const listRes = await fetch("https://api.retellai.com/v3/list-calls", {
     method: "POST",
     headers: { Authorization: `Bearer ${RETELL_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -541,8 +543,12 @@ async function runScorerSweep({ pool, hoursBack = 24, agentIds = ["agent_aa56b68
       sort_order: "descending",
     }),
   });
-  if (!listRes.ok) throw new Error(`list-calls failed (${listRes.status})`);
-  const calls = await listRes.json();
+  if (!listRes.ok) throw new Error(`v3/list-calls failed (${listRes.status})`);
+  const listBody = await listRes.json();
+  // Defensive: prefer v3 `items`, fall back to a top-level array if an older
+  // shape ever sneaks through.
+  const calls = Array.isArray(listBody?.items) ? listBody.items
+              : Array.isArray(listBody) ? listBody : [];
 
   // Filter to call_analyzed-eligible (have a transcript / completed)
   const candidates = calls.filter(c =>

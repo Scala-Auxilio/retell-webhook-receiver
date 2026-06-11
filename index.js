@@ -431,6 +431,15 @@ function calculateFuelSavings(args) {
     methodology_disclaimer: "Estimate based on EconoWind's internal sizing model; vessel-specific calibration happens before any quote.",
   };
 
+  // ── Band-floor guard (added 2026-06-11) ──────────────────────
+  // Never present a 0% (or near-0%) floor. When central is just above the 5%
+  // target, the flat ±5pp band would render e.g. "0.0% to 10.0%". Presentation
+  // only — the numbers are unchanged.
+  if (central_pct >= 5 && low_pct < 1) {
+    out.range_text = `up to ${high_pct.toFixed(1)}%, centred around ${central_pct.toFixed(1)}%`;
+    out.presentation_note = `Do NOT quote a 0% or near-0% lower bound. Present this as: savings up to ${high_pct.toFixed(1)}%, centred around ${central_pct.toFixed(1)}%.`;
+  }
+
   // ── Low-savings handling ─────────────────────────────────────
   // If the requested unit count yields a marginal / near-zero central saving,
   // never surface a 0% figure. Compute the minimum units needed to reach at

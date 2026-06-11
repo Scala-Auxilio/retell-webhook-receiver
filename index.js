@@ -309,12 +309,16 @@ function verifySignature(rawBody, signature) {
 }
 
 // ─── EconoWind Fuel Savings Calculator ──────────────────────────────────────
-// Port of Savings-formula-with-lookup-table-v2-1.xlsx. Internal-use only.
+// Port of "Savings formula with lookup table v3.xlsx" (M. Schutte, 2026-06).
+// v3 changes vs v2-1: wind amplification factor (x2) REMOVED (was double-counting,
+// per MS review 2026-06); NEW power-reduction factor 0.8 applied to effective
+// thrust ("ship power reduction by powered vessel speed", per MS v3 Excel);
+// CO2 factor now per fuel type (IMO 4th GHG Study 2020, Annex M). Internal-use only.
 // CRITICAL: returned object must NEVER include kW, DWT, ship coefficients,
 // regression internals, or VFxxxx model codes. The bot must only see
 // public-safe outputs (savings %, fuel saved tonnes, EUR cost saved, CO2).
-// Validated against Excel example: 4× 5-series on 225x38m general cargo,
-// 3000 mt/yr fuel, $600/t → central 11.4%, range 6.4–16.4%, 340.7 mt, $204,419.
+// Validated against v3 Excel example: 2× 5-series on 180x32m bulk carrier,
+// 3000 mt/yr fuel, $600/t → central 9.4%, range 4.4–14.4%, 283.5 mt, $170,090 (USD).
 const FUEL_SHIP_TYPES = {
   bulk_carrier:    { c_overall: 0.6724, kW: dwt => -4e-7 * dwt * dwt + 0.1711 * dwt + 2685 },
   chemical_tanker: { c_overall: 0.7231375, kW: dwt => 0.1924 * dwt + 2361.2 },
@@ -368,11 +372,14 @@ const FUEL_TYPE_ALIASES = {
   "ferry": "roro",
 };
 
-const FUEL_THRUST_EFFICIENCY = 0.7;
-const FUEL_DRAUGHT_FACTOR = 1/3;
-const FUEL_WIND_AMPLIFICATION = 2;
+const FUEL_THRUST_EFFICIENCY = 0.7; // IMO-standard efficiency for general calculations (per MS review 2026-06)
+const FUEL_DRAUGHT_FACTOR = 1/3; // draught proxy T = B/3 (v3 Excel, "Depth to draughth")
+const FUEL_POWER_REDUCTION = 0.8; // ship power reduction by powered vessel speed (v3 Excel; replaces removed x2 wind amplification)
 const FUEL_UNCERTAINTY_PP = 5;
-const FUEL_CO2_FACTOR = 3.146; // standard marine fuel
+// CO2 emission factors [g CO2 / g fuel] — Fourth IMO GHG Study 2020, Annex M
+// ("Fuel-based and energy-based emission factors"). General = avg of HFO and MGO.
+const FUEL_CO2_FACTOR_GENERAL = 3.16;
+const FUEL_CO2_FACTOR_LNG = 2.75; // LNG carriers (burning LNG)
 const FUEL_USD_TO_EUR = 0.92;
 const FUEL_DEFAULT_PRICE_USD = parseFloat(process.env.FUEL_DEFAULT_PRICE_USD) || 800;
 
@@ -406,8 +413,9 @@ function calculateFuelSavings(args) {
   const dwt = length_m * beam_m * draught_m * ship.c_overall;
   const engine_kw = ship.kW(dwt);
   const effective_thrust_kw = engine_kw * FUEL_THRUST_EFFICIENCY;
+  const available_power_kw = effective_thrust_kw * FUEL_POWER_REDUCTION; // v3: powered-vessel-speed reduction
   const vf_total_kw = kw_per_unit * units;
-  const central_ratio = (FUEL_WIND_AMPLIFICATION * vf_total_kw) / effective_thrust_kw;
+  const central_ratio = vf_total_kw / available_power_kw; // v3: no wind amplification factor
   const central_pct = central_ratio * 100;
   const low_pct = Math.max(0, central_pct - FUEL_UNCERTAINTY_PP);
   const high_pct = central_pct + FUEL_UNCERTAINTY_PP;
@@ -466,7 +474,8 @@ function calculateFuelSavings(args) {
       out.annual_fuel_saved_tonnes = Math.round(fuel_saved);
       out.annual_cost_saved_eur = Math.round(cost_eur);
       out.annual_cost_saved_eur_text = `~€${Math.round(cost_eur).toLocaleString("en-EU")} per year (approximate; based on ${fuel_price_usd} USD/tonne, EUR rate may vary at quoting time)`;
-      out.annual_co2_saved_tonnes = Math.round(fuel_saved * FUEL_CO2_FACTOR);
+      const co2_factor = ship_type === "lng_carrier" ? FUEL_CO2_FACTOR_LNG : FUEL_CO2_FACTOR_GENERAL;
+      out.annual_co2_saved_tonnes = Math.round(fuel_saved * co2_factor);
       out.confidence = "with_fuel_consumption";
     } else {
       out.note_for_bot = "If the visitor can share annual fuel consumption (tonnes/year), I can also return cost savings in EUR and CO2 reduction.";

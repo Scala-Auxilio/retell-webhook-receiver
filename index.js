@@ -84,6 +84,9 @@ const ECONOWIND_MANAGERS = {
 const ECONOWIND_FALLBACK_MANAGER = { name: "Willem Stam", email: "stam@econowind.nl", region: "Fallback (unmapped region)" };
 // Also CC Piet on all P1 leads
 const ECONOWIND_CC_P1 = process.env.ECONOWIND_CC_P1 || "petrusc@adsum-auxilio.com";
+// Shared sales inbox CC'd on every real (production) lead alert. Not applied
+// during ALERT_OVERRIDE_TO test mode, so test traffic never reaches real sales.
+const ECONOWIND_CC_SALES = process.env.ECONOWIND_CC_SALES || "sales@econowind.nl";
 // TEST-MODE EMAIL OVERRIDE: when set, ALL EconoWind alert emails are routed to
 // this address instead of the region-routed sales manager. Used while the
 // VentoBot widget is in soft-launch / testing so real SMs don't get test alerts.
@@ -228,10 +231,11 @@ if (RESEND_API_KEY) {
   console.log("Email not configured (set RESEND_API_KEY to enable)");
 }
 
-async function sendEmail({ from, to, subject, text, html }) {
+async function sendEmail({ from, to, subject, text, html, cc }) {
   if (!RESEND_API_KEY) {
     throw new Error("Resend API key not configured");
   }
+  const ccList = cc ? (Array.isArray(cc) ? cc : [cc]) : [];
   const resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
@@ -241,6 +245,7 @@ async function sendEmail({ from, to, subject, text, html }) {
     body: JSON.stringify({
       from: from,
       to: Array.isArray(to) ? to : [to],
+      cc: ccList.length ? ccList : undefined,
       subject: subject,
       text: text,
       html: html || undefined,
@@ -2260,6 +2265,7 @@ async function processEconowindLead(lead, receivedAt) {
   const textBody = `${priorityInfo.priority} - ${priorityInfo.label}\n\nNew EconoWind Lead: ${lead.company_name}\nContact: ${lead.contact_name} (${lead.contact_email})\nRegion: ${lead.region}\nScores: Revenue ${lead.revenue_score}/25, Conversion ${lead.conversion_score}/18\nSLA: ${priorityInfo.sla}\nAssigned to: ${manager.name}`;
 
   let recipients;
+  let ccRecipients = [];
   if (ALERT_OVERRIDE_TO) {
     // Override active: redirect every alert to the configured address.
     // ECONOWIND_CC_P1 (Piet) is CC'd on every alert during override (not only P1)
@@ -2275,9 +2281,16 @@ async function processEconowindLead(lead, receivedAt) {
     if (priorityInfo.priority === "P1" && ECONOWIND_CC_P1) {
       recipients.push(ECONOWIND_CC_P1);
     }
+    // CC the shared sales inbox on every real lead alert (P1-P3).
+    if (ECONOWIND_CC_SALES && !recipients.includes(ECONOWIND_CC_SALES)) {
+      ccRecipients.push(ECONOWIND_CC_SALES);
+    }
   }
 
-  await sendEmail({ from: ECONOWIND_FROM, to: recipients, subject, text: textBody, html });
+  await sendEmail({ from: ECONOWIND_FROM, to: recipients, cc: ccRecipients, subject, text: textBody, html });
+  if (ccRecipients.length) {
+    console.log(`  [CC] ${ccRecipients.join(", ")}`);
+  }
 
   await pool.query(
     `UPDATE econowind_leads SET notification_sent = TRUE WHERE company_name = $1 AND received_at = $2`,

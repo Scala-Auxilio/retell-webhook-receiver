@@ -36,6 +36,7 @@ jobs:
           # Deprecated endpoints — note paths are host-prefixed so we only match
           # api.retellai.com/<path> NOT api.retellai.com/v2/<path>.
           DEP_ENDPOINTS = [
+              # Deprecated 2026-06-15 — legacy list endpoints
               "/v2/list-calls",                       # -> /v3/list-calls
               "/list-chat",                           # -> POST /v3/list-chats
               "/list-phone-numbers",                  # -> /v2/list-phone-numbers
@@ -45,6 +46,11 @@ jobs:
               "/list-batch-tests",                    # -> /v2/list-batch-tests
               "/list-test-case-definitions",          # -> /v2/list-...
               "/list-test-runs",                      # -> /v2/list-test-runs (path prefix)
+              # Deprecated 2026-07-20 — legacy agent publish endpoints
+              # (no trailing slash; the word-boundary lookahead distinguishes
+              #  /publish-agent/{id} from the safe /publish-agent-version/{id})
+              "/publish-agent",                       # -> /publish-agent-version/{agent_id}
+              "/publish-chat-agent",                  # -> /publish-agent-version/{agent_id}
           ]
           # Host-anchored regexes — only match if the path follows api.retellai.com
           # directly. This is what makes /v2/list-phone-numbers (the NEW endpoint)

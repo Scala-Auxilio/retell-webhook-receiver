@@ -2792,6 +2792,19 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
     }
   }
 
+  // US country override for Scout: if the lead is a Scout lead AND the prospect's
+  // country is United States, promote scout_uk → scout_us so we call from the US
+  // DID (+1 507 577 5551). Without this, US receptionists see a +44 UK number and
+  // virtually never pick up. Mirrors the aria_en → aria_en_uk pattern above but
+  // inverse direction (Scout defaults to UK, promotes to US for US leads).
+  if (agentKey === "scout_uk" && prospect.country) {
+    const c = String(prospect.country).trim().toLowerCase();
+    if (c === "us" || c === "usa" || c === "united states" || c === "united states of america") {
+      agentKey = "scout_us";
+      console.log(`  [ROUTING] US prospect detected (country='${prospect.country}') — promoted scout_uk → scout_us (US DID)`);
+    }
+  }
+
   // Aria flip-mode guard: refuse dispatch if the shared NL DID is currently
   // bound to a different agent than the one this lead requires. The operator
   // must call POST /aria/set-agent to flip the binding first. No auto-correct.

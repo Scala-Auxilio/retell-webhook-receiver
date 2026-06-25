@@ -53,6 +53,17 @@ const AGENTS = {
     // dedicated DID bound to the Scout agent.)
     force_agent_override: true,
   },
+  // Scout US — same Scout agent, dials from the US DID (+1 507 577 5551).
+  // The US DID is bound to the Aria agent in Retell, so we need the same
+  // force_agent_override pattern as scout_uk to ensure Scout runs (not Aria).
+  // Promotion from scout_uk → scout_us happens in /zoho/aria-trigger when
+  // the lead's Country is United States.
+  scout_us: {
+    agent_id: "agent_0d66a2ab3209717eba1170b76a",
+    label: "Scout US (Sendsteps)",
+    from_number: process.env.SCOUT_US_FROM_NUMBER || process.env.ARIA_EN_FROM_NUMBER || null,
+    force_agent_override: true,
+  },
 };
 
 // CET calling window: Mon–Fri 09:00–17:00

@@ -3012,11 +3012,18 @@ app.get("/econowind/leads", requireAuth, async (req, res) => {
 });
 
 // ─── Daily retry tick scheduler ──────────────────────────────────────────────
-// Runs runRetryTick() automatically at 09:00 Europe/London every day. The
-// 09:00 slot lines up with the prospect's working morning and gives Aria a
-// full business day to redial. Cron can be disabled by setting
-// ARIA_RETRY_CRON=off (e.g. when running multi-replica — only one replica
-// should hold the cron).
+// Runs runRetryTick() + runScoutSweep() automatically at 16:05 Europe/Amsterdam
+// (16:05 CEST/CET) every weekday. The 16:05 slot is just inside the US East
+// Coast calling window (16:00-21:00 CEST = 10:00-15:00 EDT) — see
+// isBusinessHours() — so any leads stuck at "Ready for Aria EN" / "Ready for
+// Scout" because they were flipped off-hours get dispatched the moment the
+// window opens.
+//
+// Scout sweep MUST be called from the cron (not just the endpoint), otherwise
+// off-hours-flipped Scout leads stay parked indefinitely (no retry path).
+//
+// Cron can be disabled by setting ARIA_RETRY_CRON=off (e.g. when running
+// multi-replica — only one replica should hold the cron).
 function scheduleScorerSweepCron() {
   if (process.env.SCORER_SWEEP_CRON === "off") {
     console.log("[CRON] Scorer sweep DISABLED via SCORER_SWEEP_CRON=off");
@@ -3098,20 +3105,29 @@ function scheduleRetryTickCron() {
     return;
   }
   cron.schedule(
-    "0 9 * * 1-5",  // Mon-Fri only — no weekend dialing of UK university lines
+    "5 16 * * 1-5",  // 16:05 Mon-Fri Europe/Amsterdam (=10:05 EDT) — just inside
+                     // the US East Coast business hours window.
     async () => {
       const startedAt = new Date().toISOString();
-      console.log(`[CRON] Running Aria retry tick (started ${startedAt})`);
+      console.log(`[CRON] Running Aria retry tick + Scout sweep (started ${startedAt})`);
       try {
         const result = await runRetryTick();
         console.log(`[CRON] Retry tick complete: count=${result.count} flipped=${result.flipped} errors=${result.errors}`);
       } catch (err) {
         console.error("[CRON] Retry tick failed:", err.message);
       }
+      // Also run Scout sweep so off-hours-flipped "Ready for Scout" leads get
+      // dispatched. Non-fatal — failures logged but don't block the cron.
+      try {
+        const sweep = await runScoutSweep({});
+        console.log(`[CRON] Scout sweep complete: candidates=${sweep.candidates || 0} dispatched=${sweep.dispatched || 0} errors=${sweep.errors || 0}`);
+      } catch (err) {
+        console.error("[CRON] Scout sweep failed:", err.message);
+      }
     },
-    { timezone: "Europe/London" }
+    { timezone: "Europe/Amsterdam" }
   );
-  console.log("[CRON] Aria retry tick scheduled — daily at 09:00 Europe/London");
+  console.log("[CRON] Aria retry tick + Scout sweep scheduled — daily at 16:05 Europe/Amsterdam (Mon-Fri)");
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────

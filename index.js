@@ -2573,6 +2573,28 @@ async function runScoutSweep({ dryRun = false } = {}) {
         items.push({ id: zohoLead.id, ok: false, error: errs.join("; ") });
         continue;
       }
+      // In-flight guard: stamp Scout_Last_Call_Date to NOW *before* dispatch so
+      // any subsequent sweep tick sees a non-null date and skips this lead via
+      // the stuck-filter above (`!l.Scout_Last_Call_Date`). handleScoutCallEnded
+      // will overwrite this field with the real call-end timestamp when the
+      // Retell webhook fires. This makes the sweep safely idempotent under an
+      // hourly cron; without it, an hourly re-tick could double-dial a lead
+      // whose write-back hasn't landed yet (or fails silently).
+      // If the pre-stamp update fails we skip the dispatch — better a missed
+      // call than a duplicate one.
+      const nowIso = new Date().toISOString();
+      const stampRes = await fetch(`${ZOHO_CRM_BASE}/Leads/${encodeURIComponent(zohoLead.id)}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ data: [{ Scout_Last_Call_Date: nowIso }] }),
+      });
+      if (!stampRes.ok) {
+        const stampErr = await stampRes.text().catch(() => "");
+        console.warn(`[SCOUT-SWEEP] in-flight stamp failed for ${zohoLead.id} (${stampRes.status}), skipping dispatch: ${stampErr}`);
+        errors++;
+        items.push({ id: zohoLead.id, ok: false, error: `pre_dispatch_stamp_failed: ${stampRes.status}` });
+        continue;
+      }
       await createBatchCall([prospect], {
         agent: "scout_uk",
         dry_run: false,
@@ -3105,8 +3127,12 @@ function scheduleRetryTickCron() {
     return;
   }
   cron.schedule(
-    "5 16 * * 1-5",  // 16:05 Mon-Fri Europe/Amsterdam (=10:05 EDT) — just inside
-                     // the US East Coast business hours window.
+    "5 16-20 * * 1-5", // :05 past every hour 16:00-20:00 Mon-Fri Europe/Amsterdam
+                       // (= 10:05-14:05 EDT). Aligns with US East Coast business
+                       // hours window. Hourly (not daily) so Scout leads flipped
+                       // mid-window don't wait a full day. Idempotent via the
+                       // in-flight guard in runScoutSweep (Scout_Last_Call_Date
+                       // is stamped at dispatch, so subsequent ticks skip).
     async () => {
       const startedAt = new Date().toISOString();
       console.log(`[CRON] Running Aria retry tick + Scout sweep (started ${startedAt})`);
@@ -3127,7 +3153,7 @@ function scheduleRetryTickCron() {
     },
     { timezone: "Europe/Amsterdam" }
   );
-  console.log("[CRON] Aria retry tick + Scout sweep scheduled — daily at 16:05 Europe/Amsterdam (Mon-Fri)");
+  console.log("[CRON] Aria retry tick + Scout sweep scheduled — hourly at :05 from 16:00-20:00 Europe/Amsterdam (Mon-Fri)");
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────

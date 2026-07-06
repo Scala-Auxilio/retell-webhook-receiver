@@ -534,21 +534,41 @@ async function runScorerSweep({ pool, hoursBack = 24, agentIds = ["agent_aa56b68
   // Fetch recent Aria calls from Retell. The legacy POST /v2/list-calls was
   // deprecated on 2026-06-15 — we use /v3/list-calls which returns a paginated
   // shape: { items: [...], pagination_key, has_more } instead of a top-level array.
-  const listRes = await fetch("https://api.retellai.com/v3/list-calls", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${RETELL_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      limit: 100,
+  // Traverse pages via pagination_key while has_more is true, so we don't miss
+  // calls when volume in the window exceeds a single page's limit.
+  const PAGE_LIMIT = 100;
+  const MAX_PAGES = 50;              // hard stop — 5000 calls max per sweep
+  const calls = [];
+  let paginationKey = null;
+  let pageCount = 0;
+  while (true) {
+    pageCount++;
+    if (pageCount > MAX_PAGES) {
+      console.warn(`[SCORER-SWEEP] pagination hit MAX_PAGES=${MAX_PAGES}, stopping traversal`);
+      break;
+    }
+    const reqBody = {
+      limit: PAGE_LIMIT,
       filter_criteria: { agent_id: agentIds, start_timestamp: { lower_threshold: since } },
       sort_order: "descending",
-    }),
-  });
-  if (!listRes.ok) throw new Error(`v3/list-calls failed (${listRes.status})`);
-  const listBody = await listRes.json();
-  // Defensive: prefer v3 `items`, fall back to a top-level array if an older
-  // shape ever sneaks through.
-  const calls = Array.isArray(listBody?.items) ? listBody.items
-              : Array.isArray(listBody) ? listBody : [];
+    };
+    if (paginationKey) reqBody.pagination_key = paginationKey;
+    const listRes = await fetch("https://api.retellai.com/v3/list-calls", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${RETELL_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(reqBody),
+    });
+    if (!listRes.ok) throw new Error(`v3/list-calls failed (${listRes.status}) on page ${pageCount}`);
+    const listBody = await listRes.json();
+    // Defensive: prefer v3 `items`, fall back to a top-level array if an older
+    // shape ever sneaks through.
+    const pageItems = Array.isArray(listBody?.items) ? listBody.items
+                    : Array.isArray(listBody) ? listBody : [];
+    calls.push(...pageItems);
+    if (!listBody?.has_more || !listBody?.pagination_key) break;
+    paginationKey = listBody.pagination_key;
+  }
+  console.log(`[SCORER-SWEEP] v3/list-calls returned ${calls.length} calls across ${pageCount} page(s)`);
 
   // Filter to call_analyzed-eligible (have a transcript / completed)
   const candidates = calls.filter(c =>

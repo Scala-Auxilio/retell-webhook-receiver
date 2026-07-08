@@ -1274,8 +1274,19 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   const isEchoTest = transcriptText.length === 0
     && /echo test|test line|repeated back the speech|out of service/i.test(summary);
   const isFastVoicemail = disposition === "voicemail" && durationSec > 0 && durationSec < 8;
-  if (disposition !== "contact_captured" && (isEchoTest || isFastVoicemail)) {
-    console.log(`  [SCOUT] bad-number detected: ${isEchoTest ? "echo/test line" : "sub-8s voicemail"} (${durationSec}s)`);
+  // "The number you have dialed is not in service" — Scout hits these when a
+  // .edu directory lists a decommissioned line. Retell doesn't flag them as
+  // voicemail, so they arrive as user_hangup / no_contact and get retried. Catch
+  // them from the transcript so the lead is moved out of Ready-for-Scout instead
+  // of re-queued. Matches short recordings only (< 20s) to avoid false positives
+  // on real conversations that happen to mention "in service".
+  const isNotInServiceRecording = durationSec > 0 && durationSec < 20
+    && /(?:number|line) you (?:have )?dial(?:ed|led)|(?:no longer|not) in service|has been (?:disconnected|changed)|not (?:a )?working number/i.test(transcriptText);
+  if (disposition !== "contact_captured" && (isEchoTest || isFastVoicemail || isNotInServiceRecording)) {
+    const why = isEchoTest ? "echo/test line"
+              : isNotInServiceRecording ? "not-in-service recording"
+              : "sub-8s voicemail";
+    console.log(`  [SCOUT] bad-number detected: ${why} (${durationSec}s)`);
     disposition = "bad_number";
   }
 

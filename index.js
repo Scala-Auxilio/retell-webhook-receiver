@@ -1087,6 +1087,28 @@ const RETRY_PENDING_STATUSES = [
 // "Retry Aria EN" (separate work).
 const RETRY_TARGET_STATUS = "Ready for Aria EN";
 
+// ─── Scout retry cadence — mirrors Aria's 3-attempt design ─────────────────
+// Added 2026-07-10 so Scout matches Aria's retry behaviour. Same shape:
+// no-answer / voicemail → increment attempt count, schedule retry at
+// today+attempt days, cap at 3 total attempts. Depends on two Zoho custom
+// fields on the Leads module: Scout_Attempt_Count (number, default 0) and
+// Scout_Next_Retry_Date (date). Same daily 16:05 CET tick reused.
+const SCOUT_NO_ANSWER_DISPOSITIONS = new Set(["no_answer", "voicemail"]);
+const SCOUT_ATTEMPT_STATUS_MAP = {
+  1: "Scout - Attempt 1 No Answer",
+  2: "Scout - Attempt 2 No Answer",
+  3: "Scout - Attempt 3 No Answer", // dead code: cap at newCount>=3 → Max Attempts
+};
+const SCOUT_RETRY_PENDING_STATUSES = [
+  "Scout - Attempt 1 No Answer",
+  "Scout - Attempt 2 No Answer",
+];
+// Reuses "Ready for Scout" for the same reason RETRY_TARGET_STATUS reuses
+// "Ready for Aria EN": that's the value the Zoho Flow trigger listens on to
+// re-fire dispatch. Verified in production 2026-07-09.
+const SCOUT_RETRY_TARGET_STATUS = "Ready for Scout";
+const SCOUT_MAX_ATTEMPTS_STATUS = "Scout - Max Attempts";
+
 /**
  * Scan Zoho for leads whose retry date has arrived and flip them back into
  * the active dial queue. Idempotent: re-running on the same day is a no-op
@@ -1234,6 +1256,27 @@ async function fetchAttemptCount(zohoLeadId, prospectEmail) {
 }
 
 /**
+ * Fetch a lead's current Scout_Attempt_Count from Zoho CRM.
+ * Mirrors fetchAttemptCount but for the Scout-side field. Scout doesn't
+ * carry a prospectEmail through the call context so this is lead-id-only.
+ */
+async function fetchScoutAttemptCount(zohoLeadId) {
+  if (!zohoLeadId) return 0;
+  try {
+    const token = await getZohoAccessToken();
+    const headers = { Authorization: `Zoho-oauthtoken ${token}` };
+    const res = await fetch(`${ZOHO_CRM_BASE}/Leads/${zohoLeadId}?fields=id,Scout_Attempt_Count`, { headers });
+    if (res.ok) {
+      const data = await res.json();
+      return data?.data?.[0]?.Scout_Attempt_Count || 0;
+    }
+  } catch (err) {
+    console.warn(`[SCOUT] fetchScoutAttemptCount failed for ${zohoLeadId}: ${err.message}`);
+  }
+  return 0;
+}
+
+/**
  * Handle an Aria call_ended event: extract disposition and update Zoho CRM directly.
  */
 // ─── Scout (contact-capture) call-end handler ────────────────────────────────
@@ -1290,11 +1333,34 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
     disposition = "bad_number";
   }
 
-  // Map disposition → Aria_Status workflow value
+  // Map disposition → Aria_Status workflow value.
+  // For no_answer / voicemail, mirror Aria's 3-attempt retry design (see
+  // constants above): increment Scout_Attempt_Count, schedule the next retry
+  // at today+attempt days, cap at 3 total → park at Scout - Max Attempts.
   let scoutStatus;
+  let scoutRetryFields = {}; // populated only on the retry path
   if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
   else if (disposition === "bad_number") scoutStatus = "Scout - Bad Number";
-  else if (disposition === "no_answer" || disposition === "voicemail") scoutStatus = "Scout - No Answer";
+  else if (SCOUT_NO_ANSWER_DISPOSITIONS.has(disposition)) {
+    const currentCount = await fetchScoutAttemptCount(zohoLeadId);
+    const newCount = currentCount + 1;
+    if (newCount >= 3) {
+      scoutStatus = SCOUT_MAX_ATTEMPTS_STATUS;
+      scoutRetryFields = {
+        Scout_Attempt_Count:   newCount,
+        Scout_Next_Retry_Date: null,
+      };
+    } else {
+      scoutStatus = SCOUT_ATTEMPT_STATUS_MAP[newCount];
+      const retryDate = new Date();
+      retryDate.setDate(retryDate.getDate() + newCount); // +1 day after attempt 1, +2 after attempt 2
+      scoutRetryFields = {
+        Scout_Attempt_Count:   newCount,
+        Scout_Next_Retry_Date: retryDate.toISOString().split("T")[0], // YYYY-MM-DD
+      };
+    }
+    console.log(`  [SCOUT] No-answer flow | attempt: ${newCount} | status: ${scoutStatus} | retry: ${scoutRetryFields.Scout_Next_Retry_Date || "(parked)"}`);
+  }
   else scoutStatus = "Scout - No Contact"; // human reached but nothing given (refused / wrong org)
 
   const notes = [
@@ -1320,7 +1386,7 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   }
 
   // Only write captured fields that we actually have (avoid clearing on empties)
-  const extraFields = {};
+  const extraFields = { ...scoutRetryFields };
   if (email) extraFields.Scout_Captured_Email = email;
   if (name)  extraFields.Scout_Captured_Name  = name;
   if (role)  extraFields.Scout_Captured_Role  = role;
@@ -2623,6 +2689,100 @@ async function runScoutSweep({ dryRun = false } = {}) {
   return { ok: true, dryRun, count: stuck.length, dispatched, errors, items };
 }
 
+// ─── Scout retry tick — mirrors Aria's runRetryTick ─────────────────────────
+// Scans Zoho for leads in SCOUT_RETRY_PENDING_STATUSES whose
+// Scout_Next_Retry_Date has arrived, and flips them back to
+// SCOUT_RETRY_TARGET_STATUS ("Ready for Scout"), re-firing the same Zoho Flow
+// that handles initial dispatch. Same date-format, same cap semantics, same
+// idempotency guarantee as runRetryTick.
+async function runScoutRetryTick({ dryRun = false } = {}) {
+  if (!ZOHO_REFRESH_TOKEN) {
+    throw new Error("Zoho CRM not configured — cannot run Scout retry tick");
+  }
+  const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+  const token = await getZohoAccessToken();
+  const headers = {
+    Authorization: `Zoho-oauthtoken ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  const statusGroup = SCOUT_RETRY_PENDING_STATUSES
+    .map(s => `(Aria_Status:equals:${s})`)
+    .join("or");
+  const criteria = `(${statusGroup})`;
+  const fields = "id,First_Name,Last_Name,Aria_Status,Scout_Attempt_Count,Scout_Next_Retry_Date,Country,Educational_Institute";
+  const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+
+  const queryRes = await fetch(searchUrl, { headers });
+  if (!queryRes.ok && queryRes.status !== 204) {
+    const errText = await queryRes.text().catch(() => "");
+    throw new Error(`Scout retry lead search failed (${queryRes.status}): ${errText}`);
+  }
+  const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
+  const allCandidates = queryData?.data || [];
+
+  // Same in-memory filter shape as Aria: due AND attempt cap not exceeded.
+  const dueLeads = allCandidates.filter(l => {
+    if (!l.Scout_Next_Retry_Date) return false;
+    if ((l.Scout_Attempt_Count || 0) >= 3) return false;
+    return l.Scout_Next_Retry_Date <= today;
+  });
+  const filteredOut = allCandidates.length - dueLeads.length;
+  if (filteredOut > 0) {
+    console.log(`[SCOUT-RETRY] candidates=${allCandidates.length} due=${dueLeads.length} (${filteredOut} skipped: not yet due or >=3 attempts)`);
+  }
+  console.log(`[SCOUT-RETRY] today=${today} found=${dueLeads.length} dryRun=${dryRun}`);
+
+  const summarize = (lead, status) => ({
+    id: lead.id,
+    name: `${lead.First_Name || ""} ${lead.Last_Name || ""}`.trim(),
+    attempt: lead.Scout_Attempt_Count,
+    due: lead.Scout_Next_Retry_Date,
+    country: lead.Country || null,
+    institute: lead.Educational_Institute || null,
+    status: status || lead.Aria_Status,
+  });
+
+  if (dryRun || dueLeads.length === 0) {
+    return {
+      ok: true, dryRun, today,
+      count: dueLeads.length, flipped: 0, errors: 0,
+      leads: dueLeads.map(l => summarize(l)),
+    };
+  }
+
+  const updates = dueLeads.map(l => ({ id: l.id, Aria_Status: SCOUT_RETRY_TARGET_STATUS }));
+  const results = [];
+  for (let i = 0; i < updates.length; i += 100) {
+    const batch = updates.slice(i, i + 100);
+    const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ data: batch }),
+    });
+    const updateData = await updateRes.json().catch(() => ({}));
+    results.push(...(updateData?.data || []));
+  }
+
+  const flipped = results.filter(r => r?.status === "success").length;
+  const errors = results.length - flipped;
+  console.log(`[SCOUT-RETRY] flipped=${flipped}/${results.length} target='${SCOUT_RETRY_TARGET_STATUS}' errors=${errors}`);
+  dueLeads.forEach((l, idx) => {
+    const r = results[idx];
+    console.log(`[SCOUT-RETRY]   lead=${l.id} ${l.First_Name || ""} ${l.Last_Name || ""} attempt=${l.Scout_Attempt_Count} due=${l.Scout_Next_Retry_Date} → ${r?.status || "unknown"}${r?.message ? " " + r.message : ""}`);
+  });
+
+  return {
+    ok: errors === 0,
+    dryRun: false,
+    today,
+    count: dueLeads.length,
+    flipped,
+    errors,
+    leads: dueLeads.map((l, idx) => summarize(l, results[idx]?.status === "success" ? SCOUT_RETRY_TARGET_STATUS : `error: ${results[idx]?.message || "unknown"}`)),
+  };
+}
+
 // POST /aria/retry-tick
 //   Scan Zoho for leads whose Aria_Next_Retry_Date has arrived and flip them
 //   back to "Retry Aria EN" so the existing Zoho Flow re-triggers Aria.
@@ -2647,7 +2807,15 @@ app.post("/aria/retry-tick", requireAuth, async (req, res) => {
       console.error("[SCOUT-SWEEP] Error:", err.message);
       scoutSweep = { ok: false, error: err.message };
     }
-    res.json({ ...result, scout_sweep: scoutSweep });
+    // Scout retry tick — matured Scout_Next_Retry_Date leads flipped back to
+    // "Ready for Scout". Also non-fatal.
+    let scoutRetry;
+    try { scoutRetry = await runScoutRetryTick({ dryRun }); }
+    catch (err) {
+      console.error("[SCOUT-RETRY] Error:", err.message);
+      scoutRetry = { ok: false, error: err.message };
+    }
+    res.json({ ...result, scout_sweep: scoutSweep, scout_retry: scoutRetry });
   } catch (err) {
     console.error("[RETRY-TICK] Error:", err.message);
     res.status(500).json({ ok: false, error: err.message });

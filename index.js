@@ -1342,30 +1342,27 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   // Any usable email or direct phone always counts as a capture.
   if (email || phone) disposition = "contact_captured";
 
-  // Detect bad-data patterns BEFORE the status mapping so the lead is moved
-  // out of the Ready-for-Scout queue and not re-dialled:
-  //  - empty transcript + "echo test" / "test line" in the post-call summary
-  //    (number connects to a telecom echo line, not a switchboard)
-  //  - sub-8s voicemail (likely a direct staff line that VMs immediately —
-  //    wrong tool for Scout, which targets switchboards). Conservative.
+  // 2026-07-13 — Bad-number rule per Piet: ONLY flag as bad_number when the
+  // number doesn't work at all, or clearly points to a completely different
+  // organisation. Ordinary voicemail (even fast VMs on direct lines) is NOT
+  // bad — it's a live number where nobody picked up → falls through to the
+  // no_answer/retry path.
+  //
+  //  - echo/test line: empty transcript + telecom echo-line signature in the
+  //    LLM summary. Unambiguously bad.
+  //  - not-in-service recording: transcript OR summary contains a dead-line
+  //    phrase ("no longer in service", "disconnected", "not a working
+  //    number", etc.). No duration gate — a 24s Drexel-style recording is
+  //    still a dead number.
   const durationSec = Math.round((callData.duration_ms || 0) / 1000);
   const summary = (callAnalysis && (callAnalysis.call_summary || callAnalysis.summary)) || "";
   const transcriptText = String(callData.transcript || "").trim();
   const isEchoTest = transcriptText.length === 0
     && /echo test|test line|repeated back the speech|out of service/i.test(summary);
-  const isFastVoicemail = disposition === "voicemail" && durationSec > 0 && durationSec < 8;
-  // "The number you have dialed is not in service" — Scout hits these when a
-  // .edu directory lists a decommissioned line. Retell doesn't flag them as
-  // voicemail, so they arrive as user_hangup / no_contact and get retried. Catch
-  // them from the transcript so the lead is moved out of Ready-for-Scout instead
-  // of re-queued. Matches short recordings only (< 20s) to avoid false positives
-  // on real conversations that happen to mention "in service".
-  const isNotInServiceRecording = durationSec > 0 && durationSec < 20
-    && /(?:number|line) you (?:have )?dial(?:ed|led)|(?:no longer|not) in service|has been (?:disconnected|changed)|not (?:a )?working number/i.test(transcriptText);
-  if (disposition !== "contact_captured" && (isEchoTest || isFastVoicemail || isNotInServiceRecording)) {
-    const why = isEchoTest ? "echo/test line"
-              : isNotInServiceRecording ? "not-in-service recording"
-              : "sub-8s voicemail";
+  const notInServiceRegex = /(?:number|line) you (?:have )?dial(?:ed|led)|(?:no longer|not) (?:in service|in use|working)|has been (?:disconnected|changed)|(?:not|no longer) a working number|number (?:has been )?disconnected|wrong number|unable to complete (?:your|this) call/i;
+  const isNotInServiceRecording = notInServiceRegex.test(transcriptText) || notInServiceRegex.test(summary);
+  if (disposition !== "contact_captured" && (isEchoTest || isNotInServiceRecording)) {
+    const why = isEchoTest ? "echo/test line" : "not-in-service recording";
     console.log(`  [SCOUT] bad-number detected: ${why} (${durationSec}s)`);
     disposition = "bad_number";
   }

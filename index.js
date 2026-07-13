@@ -1359,7 +1359,11 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   const transcriptText = String(callData.transcript || "").trim();
   const isEchoTest = transcriptText.length === 0
     && /echo test|test line|repeated back the speech|out of service/i.test(summary);
-  const notInServiceRegex = /(?:number|line) you (?:have )?dial(?:ed|led)|(?:no longer|not) (?:in service|in use|working)|has been (?:disconnected|changed)|(?:not|no longer) a working number|number (?:has been )?disconnected|wrong number|unable to complete (?:your|this) call/i;
+  // Tight regex per Piet 2026-07-13: bad number ONLY if truly dead line or
+  // reassigned. NOT for "cannot be completed at this time" / "mailbox full"
+  // / "unable to complete this call" — those can be temporary, treat as
+  // no_answer and let the retry cycle catch them.
+  const notInServiceRegex = /(?:number|line) you (?:have )?dial(?:ed|led)|(?:no longer|not) (?:in service|in use)|has been (?:disconnected|changed)|(?:not|no longer)(?: a)? working number|number (?:has been )?disconnected|wrong number|non-?working|out of service|reached a non-working|number is disconnected/i;
   const isNotInServiceRecording = notInServiceRegex.test(transcriptText) || notInServiceRegex.test(summary);
   if (disposition !== "contact_captured" && (isEchoTest || isNotInServiceRecording)) {
     const why = isEchoTest ? "echo/test line" : "not-in-service recording";

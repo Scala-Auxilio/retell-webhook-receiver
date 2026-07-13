@@ -5,7 +5,7 @@ const { Pool } = require("pg");
 const calendly = require("./calendly");
 const scorer = require("./interaction-scorer");
 const odooProxy = require("./odoo-proxy");
-const { createBatchCall, validateProspect, mapZohoLead, agentFromAriaStatus, AGENTS } = require("./batch-caller");
+const { createBatchCall, validateProspect, mapZohoLead, mapZohoRecord, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 const analyst = require("./intelligence-analyst");
 const sendsteps = require("./sendsteps-chat");
 
@@ -999,38 +999,53 @@ async function getZohoAccessToken() {
  * Update a Zoho CRM Lead with the Aria call outcome.
  * Resolves the record by zohoLeadId first; falls back to email search.
  */
-async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes, callId, extraFields = {}, writeAriaNarrative = true }) {
+// Module-agnostic Zoho CRM writeback.
+// Introduced 2026-07-13 to extend Aria/Scout automation to Contacts. Kept the
+// old function name `updateZohoCRMLead` as an alias so any legacy caller still
+// resolves. New callers should pass `module: "Contacts"` explicitly when the
+// record is a Contact — otherwise "Leads" is assumed.
+//
+// Params:
+//   - zohoRecordId (preferred) or zohoLeadId (legacy alias): record to update
+//   - module: "Leads" | "Contacts". Default "Leads".
+//   - prospectEmail: fallback for ID resolution (searches ${module}/search)
+//   - ariaStatus: value for Aria_Status picklist (mandatory route driver)
+//   - notes, callId, extraFields: as before
+//   - writeAriaNarrative: preserve Aria's notes/last-call-date when Scout writes
+async function updateZohoCRMRecord({ zohoRecordId, zohoLeadId, module, prospectEmail, ariaStatus, notes, callId, extraFields = {}, writeAriaNarrative = true }) {
+  const mod = module || "Leads";
   const token = await getZohoAccessToken();
   const headers = {
     Authorization: `Zoho-oauthtoken ${token}`,
     "Content-Type": "application/json",
   };
 
-  let recordId = zohoLeadId;
+  let recordId = zohoRecordId || zohoLeadId;
 
-  // 1. If no direct ID, search by email
+  // 1. If no direct ID, search by email. Both Leads and Contacts modules
+  //    support the same /search?criteria=(Email:equals:...) shape.
   if (!recordId && prospectEmail) {
-    const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=(Email:equals:${encodeURIComponent(prospectEmail)})&fields=id`;
+    const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=(Email:equals:${encodeURIComponent(prospectEmail)})&fields=id`;
     const searchRes = await fetch(searchUrl, { headers });
     if (searchRes.ok) {
       const searchData = await searchRes.json();
       recordId = searchData?.data?.[0]?.id || null;
       if (recordId) {
-        console.log(`  [ZOHO] Resolved lead by email ${prospectEmail} → id ${recordId}`);
+        console.log(`  [ZOHO] Resolved ${mod} by email ${prospectEmail} → id ${recordId}`);
       } else {
-        console.warn(`  [ZOHO] No lead found for email ${prospectEmail}`);
+        console.warn(`  [ZOHO] No ${mod} found for email ${prospectEmail}`);
       }
     } else {
       const errText = await searchRes.text().catch(() => "");
-      console.warn(`  [ZOHO] Lead search failed (${searchRes.status}): ${errText}`);
+      console.warn(`  [ZOHO] ${mod} search failed (${searchRes.status}): ${errText}`);
     }
   }
 
   if (!recordId) {
-    throw new Error(`Cannot update Zoho CRM: no lead resolved (call: ${callId}, email: ${prospectEmail})`);
+    throw new Error(`Cannot update Zoho CRM: no ${mod} record resolved (call: ${callId}, email: ${prospectEmail})`);
   }
 
-  // 2. Update the lead record.
+  // 2. Update the record.
   //    Aria_Status is always written (it drives routing + downstream Flows).
   //    Aria_Notes / Aria_Last_Call_Date are only written when writeAriaNarrative
   //    is true (the default, for Aria). Scout passes writeAriaNarrative:false so it
@@ -1048,7 +1063,7 @@ async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes,
     ...extraFields,
   };
   const updateBody = { data: [record] };
-  const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
+  const updateRes = await fetch(`${ZOHO_CRM_BASE}/${mod}`, {
     method: "PUT",
     headers,
     body: JSON.stringify(updateBody),
@@ -1056,10 +1071,16 @@ async function updateZohoCRMLead({ zohoLeadId, prospectEmail, ariaStatus, notes,
   const updateData = await updateRes.json();
   const result = updateData?.data?.[0];
   if (result?.status === "error") {
-    throw new Error(`Zoho CRM update error: ${JSON.stringify(result)}`);
+    throw new Error(`Zoho CRM ${mod} update error: ${JSON.stringify(result)}`);
   }
-  console.log(`  [ZOHO] Lead updated | id: ${recordId} | Aria_Status: ${ariaStatus} | status: ${result?.status}`);
-  return { recordId, result };
+  console.log(`  [ZOHO] ${mod} updated | id: ${recordId} | Aria_Status: ${ariaStatus} | status: ${result?.status}`);
+  return { recordId, module: mod, result };
+}
+
+// Legacy alias — old callers that passed { zohoLeadId, ... } still work.
+// Delegates to updateZohoCRMRecord with module defaulting to "Leads".
+async function updateZohoCRMLead(opts) {
+  return updateZohoCRMRecord({ ...opts, zohoRecordId: opts.zohoLeadId, module: opts.module || "Leads" });
 }
 
 // Dispositions where the person didn't engage — treated as "no answer" for retry logic
@@ -1129,37 +1150,34 @@ async function runRetryTick({ dryRun = false } = {}) {
     "Content-Type": "application/json",
   };
 
-  // 1. Search Zoho — leads in any "Attempt N - No Answer" state, still under attempt cap.
-  // We use /Leads/search (criteria API) instead of COQL because the org's
-  // refresh token doesn't carry the ZohoCRM.coql.READ scope. Zoho's search
-  // criteria API rejects relational date operators on Aria_Next_Retry_Date
-  // (tested: less_equal, before — both 400 with "invalid operator found").
-  // So we filter the date in JS after the fetch. Volume is bounded (max
-  // ~hundreds of pending retries), so the in-memory filter is fine.
-  // Zoho's criteria search is finicky about operators — even less_than on
-  // number fields gets rejected. We filter the candidate set down to the
-  // status-pending leads server-side, and apply the date + attempt-cap
-  // filters in JS below.
+  // Search each module in RETRY_PENDING_STATUSES. Contacts support added 2026-07-13
+  // so converted records that still have a matured Aria_Next_Retry_Date get flipped
+  // back to "Ready for Aria EN" and re-dispatched by the sweep just like Leads.
+  // Both modules share identical Aria_Status field and picklist values.
   const statusGroup = RETRY_PENDING_STATUSES
     .map(s => `(Aria_Status:equals:${s})`)
     .join("or");
   const criteria = `(${statusGroup})`;
   const fields = "id,First_Name,Last_Name,Aria_Status,Aria_Attempt_Count,Aria_Next_Retry_Date,Country,Educational_Institute";
-  const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+  const modules = ["Leads", "Contacts"];
 
-  const queryRes = await fetch(searchUrl, { headers });
-  if (!queryRes.ok && queryRes.status !== 204) {
-    const errText = await queryRes.text().catch(() => "");
-    throw new Error(`Lead search failed (${queryRes.status}): ${errText}`);
+  // Per-module candidate collection, tagged with source module so the write-back
+  // step can PUT to the correct endpoint. Volume is bounded (~hundreds pending),
+  // so the per-module fetch + in-memory filter is fine.
+  const allCandidates = [];
+  for (const mod of modules) {
+    const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+    const queryRes = await fetch(searchUrl, { headers });
+    if (!queryRes.ok && queryRes.status !== 204) {
+      const errText = await queryRes.text().catch(() => "");
+      throw new Error(`${mod} search failed (${queryRes.status}): ${errText}`);
+    }
+    const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
+    const rows = queryData?.data || [];
+    for (const r of rows) allCandidates.push({ ...r, _module: mod });
   }
-  // 204 No Content = no matching leads
-  const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
-  const allCandidates = queryData?.data || [];
 
   // In-memory filters: date due AND attempt cap not exceeded.
-  // - Skip leads with null retry date (shouldn't normally happen but guard anyway)
-  // - Skip leads at or above 3 attempts (those should have been moved to
-  //   "Max Attempts - Nurture" by the no-answer flow but guard in case of drift)
   const dueLeads = allCandidates.filter(l => {
     if (!l.Aria_Next_Retry_Date) return false;
     if ((l.Aria_Attempt_Count || 0) >= 3) return false;
@@ -1170,10 +1188,11 @@ async function runRetryTick({ dryRun = false } = {}) {
     console.log(`[RETRY-TICK] candidates=${allCandidates.length} due=${dueLeads.length} (${filteredOut} skipped: not yet due or >=3 attempts)`);
   }
 
-  console.log(`[RETRY-TICK] today=${today} found=${dueLeads.length} dryRun=${dryRun}`);
+  console.log(`[RETRY-TICK] today=${today} found=${dueLeads.length} (Leads+Contacts) dryRun=${dryRun}`);
 
   const summarize = (lead, status) => ({
     id: lead.id,
+    module: lead._module,
     name: `${lead.First_Name || ""} ${lead.Last_Name || ""}`.trim(),
     attempt: lead.Aria_Attempt_Count,
     due: lead.Aria_Next_Retry_Date,
@@ -1194,20 +1213,30 @@ async function runRetryTick({ dryRun = false } = {}) {
     };
   }
 
-  // 2. Flip each in batches of 100 (Zoho PUT /Leads cap)
-  const updates = dueLeads.map(l => ({ id: l.id, Aria_Status: RETRY_TARGET_STATUS }));
-  const results = [];
-  for (let i = 0; i < updates.length; i += 100) {
-    const batch = updates.slice(i, i + 100);
-    const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({ data: batch }),
-    });
-    const updateData = await updateRes.json().catch(() => ({}));
-    results.push(...(updateData?.data || []));
+  // Group by module for the PUT step — /Leads and /Contacts are separate endpoints.
+  // Each Zoho batch PUT accepts up to 100 records. Track results in the same order
+  // as dueLeads so per-lead logging still lines up.
+  const resultsById = new Map();
+  for (const mod of modules) {
+    const modLeads = dueLeads.filter(l => l._module === mod);
+    if (modLeads.length === 0) continue;
+    const updates = modLeads.map(l => ({ id: l.id, Aria_Status: RETRY_TARGET_STATUS }));
+    for (let i = 0; i < updates.length; i += 100) {
+      const batch = updates.slice(i, i + 100);
+      const updateRes = await fetch(`${ZOHO_CRM_BASE}/${mod}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ data: batch }),
+      });
+      const updateData = await updateRes.json().catch(() => ({}));
+      const batchResults = updateData?.data || [];
+      batchResults.forEach((r, idx) => {
+        resultsById.set(batch[idx].id, r);
+      });
+    }
   }
 
+  const results = dueLeads.map(l => resultsById.get(l.id) || { status: "unknown" });
   const flipped = results.filter(r => r?.status === "success").length;
   const errors = results.length - flipped;
   console.log(`[RETRY-TICK] flipped=${flipped}/${results.length} target='${RETRY_TARGET_STATUS}' errors=${errors}`);
@@ -1215,7 +1244,7 @@ async function runRetryTick({ dryRun = false } = {}) {
   // Log per-lead detail (one line each — keeps Railway logs grep-friendly)
   dueLeads.forEach((l, idx) => {
     const r = results[idx];
-    console.log(`[RETRY-TICK]   lead=${l.id} ${l.First_Name || ""} ${l.Last_Name || ""} attempt=${l.Aria_Attempt_Count} due=${l.Aria_Next_Retry_Date} → ${r?.status || "unknown"}${r?.message ? " " + r.message : ""}`);
+    console.log(`[RETRY-TICK]   ${l._module}=${l.id} ${l.First_Name || ""} ${l.Last_Name || ""} attempt=${l.Aria_Attempt_Count} due=${l.Aria_Next_Retry_Date} → ${r?.status || "unknown"}${r?.message ? " " + r.message : ""}`);
   });
 
   return {
@@ -1230,22 +1259,24 @@ async function runRetryTick({ dryRun = false } = {}) {
 }
 
 /**
- * Fetch a lead's current Aria_Attempt_Count from Zoho CRM.
- * Uses lead ID if available, falls back to email search.
+ * Fetch a record's current Aria_Attempt_Count from Zoho CRM.
+ * Uses record ID if available, falls back to email search.
+ * `module` param added 2026-07-13 for Contact-module support. Defaults "Leads".
  */
-async function fetchAttemptCount(zohoLeadId, prospectEmail) {
+async function fetchAttemptCount(zohoRecordId, prospectEmail, module) {
+  const mod = module || "Leads";
   const token = await getZohoAccessToken();
   const headers = { Authorization: `Zoho-oauthtoken ${token}` };
 
-  if (zohoLeadId) {
-    const res = await fetch(`${ZOHO_CRM_BASE}/Leads/${zohoLeadId}?fields=id,Aria_Attempt_Count`, { headers });
+  if (zohoRecordId) {
+    const res = await fetch(`${ZOHO_CRM_BASE}/${mod}/${zohoRecordId}?fields=id,Aria_Attempt_Count`, { headers });
     if (res.ok) {
       const data = await res.json();
       return data?.data?.[0]?.Aria_Attempt_Count || 0;
     }
   }
   if (prospectEmail) {
-    const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=(Email:equals:${encodeURIComponent(prospectEmail)})&fields=id,Aria_Attempt_Count`;
+    const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=(Email:equals:${encodeURIComponent(prospectEmail)})&fields=id,Aria_Attempt_Count`;
     const res = await fetch(searchUrl, { headers });
     if (res.ok) {
       const data = await res.json();
@@ -1256,22 +1287,24 @@ async function fetchAttemptCount(zohoLeadId, prospectEmail) {
 }
 
 /**
- * Fetch a lead's current Scout_Attempt_Count from Zoho CRM.
+ * Fetch a record's current Scout_Attempt_Count from Zoho CRM.
  * Mirrors fetchAttemptCount but for the Scout-side field. Scout doesn't
- * carry a prospectEmail through the call context so this is lead-id-only.
+ * carry a prospectEmail through the call context so this is id-only.
+ * `module` param added 2026-07-13. Defaults "Leads".
  */
-async function fetchScoutAttemptCount(zohoLeadId) {
-  if (!zohoLeadId) return 0;
+async function fetchScoutAttemptCount(zohoRecordId, module) {
+  if (!zohoRecordId) return 0;
+  const mod = module || "Leads";
   try {
     const token = await getZohoAccessToken();
     const headers = { Authorization: `Zoho-oauthtoken ${token}` };
-    const res = await fetch(`${ZOHO_CRM_BASE}/Leads/${zohoLeadId}?fields=id,Scout_Attempt_Count`, { headers });
+    const res = await fetch(`${ZOHO_CRM_BASE}/${mod}/${zohoRecordId}?fields=id,Scout_Attempt_Count`, { headers });
     if (res.ok) {
       const data = await res.json();
       return data?.data?.[0]?.Scout_Attempt_Count || 0;
     }
   } catch (err) {
-    console.warn(`[SCOUT] fetchScoutAttemptCount failed for ${zohoLeadId}: ${err.message}`);
+    console.warn(`[SCOUT] fetchScoutAttemptCount failed for ${mod}/${zohoRecordId}: ${err.message}`);
   }
   return 0;
 }
@@ -1286,7 +1319,11 @@ async function fetchScoutAttemptCount(zohoLeadId) {
 // (Petrus's decision, 2026-05-22) — the email sequence is the only handoff.
 async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
   const dynVars = callData.retell_llm_dynamic_variables || {};
-  const zohoLeadId = dynVars.zoho_lead_id || null;
+  // 2026-07-13: read module + canonical record id from dyn-vars. In-flight calls
+  // dispatched before this refactor won't have zoho_module — default to "Leads".
+  // zoho_record_id is canonical; zoho_lead_id kept as legacy alias.
+  const zohoModule = dynVars.zoho_module || "Leads";
+  const zohoRecordId = dynVars.zoho_record_id || dynVars.zoho_lead_id || null;
   const cad = (callAnalysis && callAnalysis.custom_analysis_data) || {};
 
   const email = String(cad.scout_captured_email || "").trim();
@@ -1342,7 +1379,7 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
   else if (disposition === "bad_number") scoutStatus = "Scout - Bad Number";
   else if (SCOUT_NO_ANSWER_DISPOSITIONS.has(disposition)) {
-    const currentCount = await fetchScoutAttemptCount(zohoLeadId);
+    const currentCount = await fetchScoutAttemptCount(zohoRecordId, zohoModule);
     const newCount = currentCount + 1;
     if (newCount >= 3) {
       scoutStatus = SCOUT_MAX_ATTEMPTS_STATUS;
@@ -1373,14 +1410,14 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
     `Duration: ${durationSec}s`,
   ].filter(Boolean).join(". ");
 
-  console.log(`  [SCOUT] ${disposition} | lead: ${zohoLeadId || "(unknown)"} | email: ${email || "—"} | phone: ${phone || "—"}`);
+  console.log(`  [SCOUT] ${disposition} | ${zohoModule}/${zohoRecordId || "(unknown)"} | email: ${email || "—"} | phone: ${phone || "—"}`);
 
-  if (!zohoLeadId) {
-    console.warn(`  [SCOUT] No zoho_lead_id — cannot update CRM. Call: ${callId}`);
+  if (!zohoRecordId) {
+    console.warn(`  [SCOUT] No zoho_record_id — cannot update CRM. Call: ${callId}`);
     await pool.query(
       `INSERT INTO notifications (subject, body, priority, source, status)
        VALUES ($1, $2, 'high', 'scout_call_ended', 'skipped')`,
-      [`Scout call missing zoho_lead_id: ${callId}`, JSON.stringify({ call_id: callId, custom_analysis_data: cad })]
+      [`Scout call missing zoho_record_id: ${callId}`, JSON.stringify({ call_id: callId, custom_analysis_data: cad })]
     ).catch(() => {});
     return;
   }
@@ -1400,8 +1437,9 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   if (notes) extraFields.Scout_Notes = notes;
   extraFields.Scout_Last_Call_Date = new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00');
 
-  const crmResult = await updateZohoCRMLead({
-    zohoLeadId,
+  const crmResult = await updateZohoCRMRecord({
+    zohoRecordId,
+    module: zohoModule,
     prospectEmail: "",
     ariaStatus: scoutStatus,
     notes,
@@ -1415,24 +1453,27 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
      VALUES ($1, $2, 'normal', 'scout_call_ended', 'sent')`,
     [
       `Scout ${disposition}: ${name || "contact"} (${email || "no email"})`,
-      JSON.stringify({ lead_id: zohoLeadId, record_id: crmResult && crmResult.recordId, disposition, scout_status: scoutStatus, email, name, role, phone, call_id: callId, agent: agentLabel, duration_sec: durationSec }),
+      JSON.stringify({ zoho_module: zohoModule, zoho_record_id: zohoRecordId, record_id: crmResult && crmResult.recordId, disposition, scout_status: scoutStatus, email, name, role, phone, call_id: callId, agent: agentLabel, duration_sec: durationSec }),
     ]
   ).catch(() => {});
 }
 
 async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {
   const dynVars = callData.retell_llm_dynamic_variables || {};
-  // Zoho CRM lead IDs are numeric long integers. If dynVars.zoho_lead_id is
-  // present but non-numeric (e.g. ad-hoc test calls dialed directly via the
-  // Retell API without a real Zoho lead behind them), treat it as missing —
-  // otherwise Zoho rejects the update with INVALID_DATA and we spam the
-  // notifications inbox with false-positive "Aria Zoho update failed" alerts.
-  const zohoLeadId = (() => {
-    const raw = dynVars.zoho_lead_id;
+  // 2026-07-13: module + canonical record id, with backward-compat to
+  // zoho_lead_id for in-flight calls dispatched before the refactor.
+  const zohoModule = dynVars.zoho_module || "Leads";
+  // Zoho CRM record IDs are numeric long integers. If the ID is present but
+  // non-numeric (e.g. ad-hoc test calls dialed directly via the Retell API
+  // without a real Zoho record behind them), treat it as missing — otherwise
+  // Zoho rejects the update with INVALID_DATA and we spam the notifications
+  // inbox with false-positive "Aria Zoho update failed" alerts.
+  const zohoRecordId = (() => {
+    const raw = dynVars.zoho_record_id || dynVars.zoho_lead_id;
     if (raw === undefined || raw === null || raw === "") return null;
     const str = String(raw).trim();
     if (!/^\d+$/.test(str)) {
-      console.warn(`  [ARIA] Ignoring non-numeric zoho_lead_id='${str}' — treating as missing (likely ad-hoc test call)`);
+      console.warn(`  [ARIA] Ignoring non-numeric zoho record id='${str}' — treating as missing (likely ad-hoc test call)`);
       return null;
     }
     return str;
@@ -1443,25 +1484,25 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
   // Extract prospect email early — used as fallback CRM identifier when zoho_lead_id is null
   const prospectEmail = callAnalysis?.prospect_email || callAnalysis?.email || dynVars.prospect_email || "";
 
-  console.log(`  [ARIA] Call ended for ${agentLabel} | lead: ${zohoLeadId || "(unknown)"} | prospect: ${prospectName}`);
+  console.log(`  [ARIA] Call ended for ${agentLabel} | ${zohoModule}/${zohoRecordId || "(unknown)"} | prospect: ${prospectName}`);
 
-  // We need at least zoho_lead_id OR prospect_email to identify and update the CRM record
-  if (!zohoLeadId && !prospectEmail) {
-    console.warn(`  [ARIA] No zoho_lead_id or prospect_email — cannot update Zoho CRM. Call: ${callId}`);
+  // We need at least zoho_record_id OR prospect_email to identify and update the CRM record
+  if (!zohoRecordId && !prospectEmail) {
+    console.warn(`  [ARIA] No zoho_record_id or prospect_email — cannot update Zoho CRM. Call: ${callId}`);
     console.warn(`  [ARIA] Dynamic variables received:`, JSON.stringify(dynVars));
     await pool.query(
       `INSERT INTO notifications (subject, body, priority, source, status)
        VALUES ($1, $2, 'high', 'aria_call_ended', 'skipped')`,
       [
-        `Aria call missing zoho_lead_id and email: ${prospectName || callId}`,
+        `Aria call missing zoho record id and email: ${prospectName || callId}`,
         JSON.stringify({ call_id: callId, agent: agentLabel, dynamic_vars: dynVars }),
       ]
     );
     return;
   }
 
-  if (!zohoLeadId) {
-    console.warn(`  [ARIA] zoho_lead_id is null — will attempt CRM lookup by email (${prospectEmail})`);
+  if (!zohoRecordId) {
+    console.warn(`  [ARIA] zoho_record_id is null — will attempt CRM lookup by email (${prospectEmail}) in ${zohoModule}`);
   }
 
   // Map the disposition
@@ -1478,7 +1519,7 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
     `Disposition method: ${method} (${confidence})`,
   ].filter(Boolean).join(". ");
 
-  console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | lead: ${zohoLeadId || "(via email)"}`);
+  console.log(`  [ARIA] Disposition: ${disposition} (${method}, ${confidence}) | ${zohoModule}/${zohoRecordId || "(via email)"}`);
 
   // Resolve the final Zoho CRM Aria_Status picklist value and any extra fields
   let ariaStatus;
@@ -1486,7 +1527,7 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
 
   if (NO_ANSWER_DISPOSITIONS.has(disposition)) {
     // Hung up early or no answer — treat identically: increment attempt count, schedule retry
-    const currentCount = await fetchAttemptCount(zohoLeadId, prospectEmail);
+    const currentCount = await fetchAttemptCount(zohoRecordId, prospectEmail, zohoModule);
     const newCount = currentCount + 1;
 
     // 3-attempt cap (per rubric design 2026-05-05). After the 3rd attempt
@@ -1515,8 +1556,9 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
   }
 
   // Update Zoho CRM directly via API
-  const crmResult = await updateZohoCRMLead({
-    zohoLeadId,
+  const crmResult = await updateZohoCRMRecord({
+    zohoRecordId,
+    module: zohoModule,
     prospectEmail,
     ariaStatus,
     notes,
@@ -1526,7 +1568,8 @@ async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, r
 
   // Log success to DB
   const zohoPayload = {
-    lead_id:    zohoLeadId,
+    zoho_module: zohoModule,
+    zoho_record_id: zohoRecordId,
     record_id:  crmResult.recordId,
     disposition,
     aria_status: ariaStatus,
@@ -2606,84 +2649,96 @@ async function runScoutSweep({ dryRun = false } = {}) {
   const token = await getZohoAccessToken();
   const headers = { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" };
 
-  // The deployed Zoho refresh token doesn't carry COQL scope (see runRetryTick
-  // comment), so we use /Leads/search and filter in JS.
+  // 2026-07-13: sweep both Leads AND Contacts. Same criteria + fields work on
+  // both modules after the field-parity migration. Candidates are tagged with
+  // their source module so the pre-stamp PUT + dispatch route to the correct
+  // endpoint. The deployed Zoho refresh token doesn't carry COQL scope, so
+  // we use /Leads/search and /Contacts/search + JS filtering.
   const criteria = `(Aria_Status:equals:Ready for Scout)`;
-  const fields = "id,First_Name,Last_Name,Email,Phone,Mobile,Company,Country,Educational_Institute,Lead_Source,Industry,Language,Scout_Last_Call_Date";
-  const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+  // Company is Lead-only; Contact uses Account_Name (lookup). Both modules
+  // now have Educational_Institute (populated on conversion). Include both in
+  // the field list — missing fields on Contact just return null.
+  const fields = "id,First_Name,Last_Name,Email,Phone,Mobile,Company,Account_Name,Country,Educational_Institute,Lead_Source,Industry,Language,Scout_Last_Call_Date";
+  const modules = ["Leads", "Contacts"];
 
-  const qr = await fetch(searchUrl, { headers });
-  if (!qr.ok && qr.status !== 204) {
-    const errText = await qr.text().catch(() => "");
-    throw new Error(`[SCOUT-SWEEP] Lead search failed (${qr.status}): ${errText}`);
+  const candidates = [];
+  for (const mod of modules) {
+    const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+    const qr = await fetch(searchUrl, { headers });
+    if (!qr.ok && qr.status !== 204) {
+      const errText = await qr.text().catch(() => "");
+      throw new Error(`[SCOUT-SWEEP] ${mod} search failed (${qr.status}): ${errText}`);
+    }
+    const qd = qr.status === 204 ? { data: [] } : await qr.json();
+    const rows = qd?.data || [];
+    for (const r of rows) candidates.push({ ...r, _module: mod });
   }
-  const qd = qr.status === 204 ? { data: [] } : await qr.json();
-  const candidates = qd?.data || [];
 
   // Only stuck ones — Scout_Last_Call_Date null means Scout has never called.
   const stuck = candidates.filter(l => !l.Scout_Last_Call_Date);
-  console.log(`[SCOUT-SWEEP] candidates=${candidates.length} stuck=${stuck.length} dryRun=${dryRun}`);
+  console.log(`[SCOUT-SWEEP] candidates=${candidates.length} stuck=${stuck.length} (Leads+Contacts) dryRun=${dryRun}`);
 
   if (dryRun || stuck.length === 0) {
     return {
       ok: true, dryRun, count: stuck.length, dispatched: 0, errors: 0,
       leads: stuck.map(l => ({
         id: l.id,
+        module: l._module,
         name: `${l.First_Name||""} ${l.Last_Name||""}`.trim(),
-        university: l.Company || l.Educational_Institute || null,
+        university: l.Educational_Institute || l.Company || (l.Account_Name && l.Account_Name.name) || null,
       })),
     };
   }
 
   let dispatched = 0, errors = 0;
   const items = [];
-  for (const zohoLead of stuck) {
+  for (const zohoRecord of stuck) {
+    const mod = zohoRecord._module;
     try {
-      // mapZohoLead expects the Zoho payload shape; lead_id is the standard alias.
-      const leadObj = { ...zohoLead, lead_id: zohoLead.id, Aria_Status: "Ready for Scout" };
-      const prospect = mapZohoLead(leadObj);
-      if (!prospect.zoho_lead_id) prospect.zoho_lead_id = zohoLead.id;
+      // mapZohoRecord picks up the record shape and echoes _module through as
+      // prospect.zoho_module, which then rides in the Retell dyn-vars so the
+      // call_ended webhook writes back to the correct module.
+      const recordObj = { ...zohoRecord, Aria_Status: "Ready for Scout" };
+      const prospect = mapZohoRecord(recordObj, mod);
+      if (!prospect.zoho_record_id) prospect.zoho_record_id = zohoRecord.id;
+      if (!prospect.zoho_lead_id) prospect.zoho_lead_id = zohoRecord.id;
+      if (!prospect.zoho_module) prospect.zoho_module = mod;
       const errs = validateProspect(prospect, 1);
       if (errs.length) {
-        console.warn(`[SCOUT-SWEEP] skip ${zohoLead.id}: ${errs.join("; ")}`);
+        console.warn(`[SCOUT-SWEEP] skip ${mod}/${zohoRecord.id}: ${errs.join("; ")}`);
         errors++;
-        items.push({ id: zohoLead.id, ok: false, error: errs.join("; ") });
+        items.push({ id: zohoRecord.id, module: mod, ok: false, error: errs.join("; ") });
         continue;
       }
       // In-flight guard: stamp Scout_Last_Call_Date to NOW *before* dispatch so
-      // any subsequent sweep tick sees a non-null date and skips this lead via
-      // the stuck-filter above (`!l.Scout_Last_Call_Date`). handleScoutCallEnded
-      // will overwrite this field with the real call-end timestamp when the
-      // Retell webhook fires. This makes the sweep safely idempotent under an
-      // hourly cron; without it, an hourly re-tick could double-dial a lead
-      // whose write-back hasn't landed yet (or fails silently).
-      // If the pre-stamp update fails we skip the dispatch — better a missed
-      // call than a duplicate one.
+      // any subsequent sweep tick sees a non-null date and skips this record.
+      // handleScoutCallEnded will overwrite this field with the real call-end
+      // timestamp when the Retell webhook fires. Idempotent under hourly cron.
       const nowIso = new Date().toISOString();
-      const stampRes = await fetch(`${ZOHO_CRM_BASE}/Leads/${encodeURIComponent(zohoLead.id)}`, {
+      const stampRes = await fetch(`${ZOHO_CRM_BASE}/${mod}/${encodeURIComponent(zohoRecord.id)}`, {
         method: "PUT",
         headers,
         body: JSON.stringify({ data: [{ Scout_Last_Call_Date: nowIso }] }),
       });
       if (!stampRes.ok) {
         const stampErr = await stampRes.text().catch(() => "");
-        console.warn(`[SCOUT-SWEEP] in-flight stamp failed for ${zohoLead.id} (${stampRes.status}), skipping dispatch: ${stampErr}`);
+        console.warn(`[SCOUT-SWEEP] in-flight stamp failed for ${mod}/${zohoRecord.id} (${stampRes.status}), skipping dispatch: ${stampErr}`);
         errors++;
-        items.push({ id: zohoLead.id, ok: false, error: `pre_dispatch_stamp_failed: ${stampRes.status}` });
+        items.push({ id: zohoRecord.id, module: mod, ok: false, error: `pre_dispatch_stamp_failed: ${stampRes.status}` });
         continue;
       }
       await createBatchCall([prospect], {
         agent: "scout_uk",
         dry_run: false,
-        name: `Scout sweep: ${prospect.university_name || "?"} (${zohoLead.id})`,
+        name: `Scout sweep: ${prospect.university_name || "?"} (${mod}/${zohoRecord.id})`,
       });
       dispatched++;
-      items.push({ id: zohoLead.id, ok: true, university: prospect.university_name });
-      console.log(`[SCOUT-SWEEP] dispatched ${zohoLead.id} (${prospect.university_name})`);
+      items.push({ id: zohoRecord.id, module: mod, ok: true, university: prospect.university_name });
+      console.log(`[SCOUT-SWEEP] dispatched ${mod}/${zohoRecord.id} (${prospect.university_name})`);
     } catch (err) {
       errors++;
-      items.push({ id: zohoLead.id, ok: false, error: err.message });
-      console.warn(`[SCOUT-SWEEP] dispatch failed for ${zohoLead.id}: ${err.message}`);
+      items.push({ id: zohoRecord.id, module: mod, ok: false, error: err.message });
+      console.warn(`[SCOUT-SWEEP] dispatch failed for ${mod}/${zohoRecord.id}: ${err.message}`);
     }
   }
   return { ok: true, dryRun, count: stuck.length, dispatched, errors, items };
@@ -2711,15 +2766,23 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
     .join("or");
   const criteria = `(${statusGroup})`;
   const fields = "id,First_Name,Last_Name,Aria_Status,Scout_Attempt_Count,Scout_Next_Retry_Date,Country,Educational_Institute";
-  const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+  const modules = ["Leads", "Contacts"];
 
-  const queryRes = await fetch(searchUrl, { headers });
-  if (!queryRes.ok && queryRes.status !== 204) {
-    const errText = await queryRes.text().catch(() => "");
-    throw new Error(`Scout retry lead search failed (${queryRes.status}): ${errText}`);
+  // 2026-07-13: search both modules. Contacts store Scout_Attempt_Count and
+  // Scout_Next_Retry_Date after the field-parity migration, so retry candidates
+  // can arise from either side after conversion.
+  const allCandidates = [];
+  for (const mod of modules) {
+    const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
+    const queryRes = await fetch(searchUrl, { headers });
+    if (!queryRes.ok && queryRes.status !== 204) {
+      const errText = await queryRes.text().catch(() => "");
+      throw new Error(`Scout retry ${mod} search failed (${queryRes.status}): ${errText}`);
+    }
+    const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
+    const rows = queryData?.data || [];
+    for (const r of rows) allCandidates.push({ ...r, _module: mod });
   }
-  const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
-  const allCandidates = queryData?.data || [];
 
   // Same in-memory filter shape as Aria: due AND attempt cap not exceeded.
   const dueLeads = allCandidates.filter(l => {
@@ -2731,10 +2794,11 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
   if (filteredOut > 0) {
     console.log(`[SCOUT-RETRY] candidates=${allCandidates.length} due=${dueLeads.length} (${filteredOut} skipped: not yet due or >=3 attempts)`);
   }
-  console.log(`[SCOUT-RETRY] today=${today} found=${dueLeads.length} dryRun=${dryRun}`);
+  console.log(`[SCOUT-RETRY] today=${today} found=${dueLeads.length} (Leads+Contacts) dryRun=${dryRun}`);
 
   const summarize = (lead, status) => ({
     id: lead.id,
+    module: lead._module,
     name: `${lead.First_Name || ""} ${lead.Last_Name || ""}`.trim(),
     attempt: lead.Scout_Attempt_Count,
     due: lead.Scout_Next_Retry_Date,
@@ -2751,25 +2815,34 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
     };
   }
 
-  const updates = dueLeads.map(l => ({ id: l.id, Aria_Status: SCOUT_RETRY_TARGET_STATUS }));
-  const results = [];
-  for (let i = 0; i < updates.length; i += 100) {
-    const batch = updates.slice(i, i + 100);
-    const updateRes = await fetch(`${ZOHO_CRM_BASE}/Leads`, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({ data: batch }),
-    });
-    const updateData = await updateRes.json().catch(() => ({}));
-    results.push(...(updateData?.data || []));
+  // Group PUTs by module — /Leads and /Contacts are separate endpoints.
+  const resultsById = new Map();
+  for (const mod of modules) {
+    const modLeads = dueLeads.filter(l => l._module === mod);
+    if (modLeads.length === 0) continue;
+    const updates = modLeads.map(l => ({ id: l.id, Aria_Status: SCOUT_RETRY_TARGET_STATUS }));
+    for (let i = 0; i < updates.length; i += 100) {
+      const batch = updates.slice(i, i + 100);
+      const updateRes = await fetch(`${ZOHO_CRM_BASE}/${mod}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ data: batch }),
+      });
+      const updateData = await updateRes.json().catch(() => ({}));
+      const batchResults = updateData?.data || [];
+      batchResults.forEach((r, idx) => {
+        resultsById.set(batch[idx].id, r);
+      });
+    }
   }
 
+  const results = dueLeads.map(l => resultsById.get(l.id) || { status: "unknown" });
   const flipped = results.filter(r => r?.status === "success").length;
   const errors = results.length - flipped;
   console.log(`[SCOUT-RETRY] flipped=${flipped}/${results.length} target='${SCOUT_RETRY_TARGET_STATUS}' errors=${errors}`);
   dueLeads.forEach((l, idx) => {
     const r = results[idx];
-    console.log(`[SCOUT-RETRY]   lead=${l.id} ${l.First_Name || ""} ${l.Last_Name || ""} attempt=${l.Scout_Attempt_Count} due=${l.Scout_Next_Retry_Date} → ${r?.status || "unknown"}${r?.message ? " " + r.message : ""}`);
+    console.log(`[SCOUT-RETRY]   ${l._module}=${l.id} ${l.First_Name || ""} ${l.Last_Name || ""} attempt=${l.Scout_Attempt_Count} due=${l.Scout_Next_Retry_Date} → ${r?.status || "unknown"}${r?.message ? " " + r.message : ""}`);
   });
 
   return {
@@ -2927,39 +3000,51 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
     return res.json({ skipped: true, reason: "missing_aria_status" });
   }
 
-  // Map Zoho lead to prospect format
-  const prospect = mapZohoLead(zohoLead);
+  // 2026-07-13: module detection. Zoho Flow can send `_module` in the webhook
+  // body (recommended pattern when a Contact-side Flow is set up). Fallback:
+  // infer from field shape (Contact has Account_Name lookup, Lead has Company).
+  // If unsure, default to Leads for backward compat with the pre-refactor flow.
+  const zohoModule = zohoLead._module
+    || zohoLead.Module
+    || (zohoLead.Account_Name && !zohoLead.Lead_Source ? "Contacts" : "Leads");
+  console.log(`  [ZOHO] Trigger for ${zohoModule} module`);
 
-  // ── Resolve missing fields from Zoho CRM (workaround: Zoho Flow cannot
-  //    send ${trigger.id}, ${trigger.Owner.email}, ${trigger.Owner.name}) ──
-  if (!prospect.zoho_lead_id && prospect.email) {
+  // Map Zoho record to prospect format (module-aware)
+  const prospect = mapZohoRecord(zohoLead, zohoModule);
+
+  // ── Resolve missing record id from Zoho CRM by email lookup (workaround:
+  //    Zoho Flow cannot send ${trigger.id}, ${trigger.Owner.email}, etc.) ──
+  //    Searches the correct module (Leads or Contacts). Both endpoints accept
+  //    identical criteria + fields.
+  if (!prospect.zoho_record_id && prospect.email) {
     try {
       const token = await getZohoAccessToken();
       const headers = { Authorization: `Zoho-oauthtoken ${token}` };
-      const searchUrl = `${ZOHO_CRM_BASE}/Leads/search?criteria=(Email:equals:${encodeURIComponent(prospect.email)})&fields=id,Owner,Full_Name`;
+      const searchUrl = `${ZOHO_CRM_BASE}/${zohoModule}/search?criteria=(Email:equals:${encodeURIComponent(prospect.email)})&fields=id,Owner,Full_Name`;
       const searchRes = await fetch(searchUrl, { headers });
       if (searchRes.ok) {
         const searchData = await searchRes.json();
-        const lead = searchData?.data?.[0];
-        if (lead) {
-          prospect.zoho_lead_id = lead.id;
-          console.log(`  [ZOHO-RESOLVE] Resolved lead by email ${prospect.email} → id ${lead.id}`);
+        const rec = searchData?.data?.[0];
+        if (rec) {
+          prospect.zoho_record_id = rec.id;
+          prospect.zoho_lead_id = rec.id; // keep legacy alias in sync
+          console.log(`  [ZOHO-RESOLVE] Resolved ${zohoModule} by email ${prospect.email} → id ${rec.id}`);
 
           // Also patch Owner fields if missing
-          if (!prospect.lead_owner_email && lead.Owner?.email) {
-            prospect.lead_owner_email = lead.Owner.email;
+          if (!prospect.lead_owner_email && rec.Owner?.email) {
+            prospect.lead_owner_email = rec.Owner.email;
           }
-          if (!prospect.lead_owner_name && lead.Owner?.name) {
-            prospect.lead_owner_name = lead.Owner.name;
+          if (!prospect.lead_owner_name && rec.Owner?.name) {
+            prospect.lead_owner_name = rec.Owner.name;
           }
         } else {
-          console.warn(`  [ZOHO-RESOLVE] No lead found for email ${prospect.email}`);
+          console.warn(`  [ZOHO-RESOLVE] No ${zohoModule} record found for email ${prospect.email}`);
         }
       } else {
-        console.warn(`  [ZOHO-RESOLVE] Search failed (${searchRes.status})`);
+        console.warn(`  [ZOHO-RESOLVE] ${zohoModule} search failed (${searchRes.status})`);
       }
     } catch (resolveErr) {
-      console.error(`  [ZOHO-RESOLVE] Error resolving lead:`, resolveErr.message);
+      console.error(`  [ZOHO-RESOLVE] Error resolving ${zohoModule} record:`, resolveErr.message);
       // Fail-open: continue dispatch even if resolution fails
     }
   }

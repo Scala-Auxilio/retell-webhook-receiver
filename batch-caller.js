@@ -119,32 +119,74 @@ function mapOwnerToSpecialist(ownerObj) {
   return null;
 }
 
-// ─── Zoho CRM Lead → Prospect mapping ───────────────────────────────────────
-// Zoho Flow sends lead data in Zoho CRM field names. This maps to our format.
-function mapZohoLead(zohoLead) {
-  const firstName = zohoLead.First_Name || zohoLead.first_name || "";
-  const lastName = zohoLead.Last_Name || zohoLead.last_name || "";
-  const eduLevel = zohoLead.Edu_level || zohoLead.edu_level || "";
-  const jobTitle = zohoLead.Job_Title_Edu || zohoLead.Job_Title_Business || zohoLead.job_title_edu || "";
+// ─── Zoho CRM Record → Prospect mapping ─────────────────────────────────────
+// Zoho Flow sends record data in Zoho CRM field names. This maps to our format.
+//
+// Historically only Leads were supported (function was mapZohoLead). As of
+// 2026-07-13 the receiver also handles Contacts — the field set is identical
+// (Aria_*/Scout_* fields are duplicated across both modules, propagated on
+// Lead conversion by explicit conversion mapping). The `module` param is used
+// to (a) preserve module identity through the outbound Retell call, and
+// (b) route write-back to the correct API endpoint (/Leads vs /Contacts).
+//
+// Default is "Leads" for backward-compat with any caller that predates
+// the multi-module refactor. Also detects Contact-specific fields (e.g.
+// Account_Name lookup) and auto-flips module in that case.
+function mapZohoRecord(zohoRecord, moduleArg) {
+  // Auto-detect module from payload shape if not explicitly provided.
+  // Contact records carry Account_Name (lookup) and lack Lead_Source/Company.
+  // If caller passes explicit module, trust it. If _module is embedded in the
+  // Zoho Flow payload (recommended pattern), use that. Fallback: Leads.
+  let module = moduleArg
+    || zohoRecord._module
+    || zohoRecord.Module
+    || (zohoRecord.Account_Name && !zohoRecord.Lead_Source ? "Contacts" : "Leads");
 
-  // Build ownerObj from whatever form Zoho sends.
+  const firstName = zohoRecord.First_Name || zohoRecord.first_name || "";
+  const lastName = zohoRecord.Last_Name || zohoRecord.last_name || "";
+  const eduLevel = zohoRecord.Edu_level || zohoRecord.edu_level || "";
+  const jobTitle = zohoRecord.Job_Title_Edu || zohoRecord.Job_Title_Business || zohoRecord.Job_Title_Business1 || zohoRecord.job_title_edu || "";
+
+  // Owner shape identical on Leads and Contacts. See legacy notes below.
   // Zoho Flow webhook sends Owner as a plain string (display name) plus separate
   // Owner_Name and Owner_Email fields (when configured in the webhook body).
   // The CRM API sends Owner as a full object { id, name, email }.
-  const ownerRaw = zohoLead.Owner || zohoLead.owner;
+  const ownerRaw = zohoRecord.Owner || zohoRecord.owner;
   let ownerObj = null;
   if (ownerRaw && typeof ownerRaw === "object") {
     ownerObj = ownerRaw; // CRM API object — use directly
   } else {
-    const ownerName = zohoLead.Owner_Name || zohoLead.owner_name || (typeof ownerRaw === "string" ? ownerRaw : "");
-    const ownerEmail = zohoLead.Owner_Email || zohoLead.owner_email || "";
+    const ownerName = zohoRecord.Owner_Name || zohoRecord.owner_name || (typeof ownerRaw === "string" ? ownerRaw : "");
+    const ownerEmail = zohoRecord.Owner_Email || zohoRecord.owner_email || "";
     if (ownerName || ownerEmail) ownerObj = { name: ownerName, email: ownerEmail };
   }
   const specialist = mapOwnerToSpecialist(ownerObj);
 
+  // university_name resolution: Educational_Institute exists on both modules
+  // after the 2026-07-13 field-parity work. Contact.Account_Name is a lookup
+  // object { name, id } from the CRM API — use its .name when present as a
+  // secondary fallback. Company is Lead-only.
+  const accountName = (zohoRecord.Account_Name && typeof zohoRecord.Account_Name === "object")
+    ? zohoRecord.Account_Name.name
+    : (zohoRecord.Account_Name || "");
+  const university = zohoRecord.Educational_Institute
+    || zohoRecord.Educational_institute
+    || accountName
+    || zohoRecord.Company
+    || zohoRecord.company
+    || "";
+
+  // Record ID resolution: Zoho Flow / Deluge serialises the record ID as "ID"
+  // (all-caps); CRM API v2 uses "id" (lowercase). We check every casing variant.
+  const recordId = zohoRecord.ID || zohoRecord.id || zohoRecord.Id
+    || zohoRecord.record_id || zohoRecord.Record_Id
+    || zohoRecord.lead_id || zohoRecord.Lead_Id || zohoRecord.LEADID || zohoRecord.Lead_ID
+    || zohoRecord.contact_id || zohoRecord.Contact_Id
+    || null;
+
   return {
-    phone_number: normalizePhone(zohoLead.Phone || zohoLead.phone || ""),
-    university_name: zohoLead.Educational_Institute || zohoLead.Educational_institute || zohoLead.Company || zohoLead.company || "",
+    phone_number: normalizePhone(zohoRecord.Phone || zohoRecord.phone || ""),
+    university_name: university,
     // Retell agent uses {{prospect_first_name}} — keep first/last split
     first_name: firstName,
     last_name: lastName,
@@ -152,25 +194,34 @@ function mapZohoLead(zohoLead) {
     contact_title: jobTitle,
     // Retell agent uses {{persona_type}} — derive from edu_level or job title
     persona_type: derivePersonaType(eduLevel, jobTitle),
-    department: zohoLead.Segment || zohoLead.segment || "",
-    country: zohoLead.Country || zohoLead.country || "",
-    sendsteps_product: zohoLead.Sendsteps_Product || zohoLead.sendsteps_product || "Interactive Presentations",
-    notes: zohoLead.Description || zohoLead.description || "",
-    // Zoho metadata (preserved for status callback)
-    // Zoho Flow / Deluge serialises the record ID as "ID" (all-caps); CRM API v2 uses "id" (lowercase).
-    // We check every casing variant to be safe.
-    zoho_lead_id: zohoLead.ID || zohoLead.id || zohoLead.Id || zohoLead.lead_id || zohoLead.Lead_Id || zohoLead.LEADID || zohoLead.Lead_ID || null,
+    department: zohoRecord.Segment || zohoRecord.segment || "",
+    country: zohoRecord.Country || zohoRecord.country || "",
+    sendsteps_product: zohoRecord.Sendsteps_Product || zohoRecord.sendsteps_product || "Interactive Presentations",
+    notes: zohoRecord.Description || zohoRecord.description || "",
+    // ── Zoho record identity (round-trips back in call_ended webhook) ──
+    // zoho_module + zoho_record_id are the canonical fields introduced 2026-07-13.
+    // zoho_lead_id is kept as a legacy alias so any code path (or in-flight call
+    // dispatched before the refactor) that reads zoho_lead_id still finds the id.
+    zoho_module: module,
+    zoho_record_id: recordId,
+    zoho_lead_id: recordId, // legacy alias
     edu_level: eduLevel,
-    type_of_plan: zohoLead.Type_of_Plan || zohoLead.type_of_plan || "",
-    language: zohoLead.Language || zohoLead.language || "",
+    type_of_plan: zohoRecord.Type_of_Plan || zohoRecord.type_of_plan || "",
+    language: zohoRecord.Language || zohoRecord.language || "",
     // Email — used by Retell agent to pre-fill booking invite address
-    email: zohoLead.Email || zohoLead.email || "",
+    email: zohoRecord.Email || zohoRecord.email || "",
     // Social proof reference university for pitch node
-    reference_university: zohoLead.Reference_University || zohoLead.reference_university || "TU Delft",
+    reference_university: zohoRecord.Reference_University || zohoRecord.reference_university || "TU Delft",
     // Calendly specialist routing (derived from Lead Owner)
     specialist: specialist,
-    lead_owner_name: ownerObj ? (ownerObj.name || zohoLead.Owner_Name || "") : "",
+    lead_owner_name: ownerObj ? (ownerObj.name || zohoRecord.Owner_Name || "") : "",
   };
+}
+
+// Legacy alias — many callers still import mapZohoLead by name. New code
+// should call mapZohoRecord(record, module) explicitly.
+function mapZohoLead(zohoLead) {
+  return mapZohoRecord(zohoLead);
 }
 
 // Derive persona_type for Retell agent (Opener/Qualify/Pitch branch on this)
@@ -271,7 +322,11 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
       prospect_email: p.email || "",
       reference_university: p.reference_university || "TU Delft",
       // ── Zoho CRM tracking (round-trips back in call_ended webhook) ──
-      zoho_lead_id: p.zoho_lead_id || "",
+      // zoho_module + zoho_record_id are the canonical fields (2026-07-13+).
+      // zoho_lead_id kept as legacy alias so old handler code still finds the id.
+      zoho_module: p.zoho_module || "Leads",
+      zoho_record_id: p.zoho_record_id || p.zoho_lead_id || "",
+      zoho_lead_id: p.zoho_record_id || p.zoho_lead_id || "",
     },
   }));
 
@@ -455,4 +510,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { createBatchCall, parseProspectList, buildBatchPayload, validateProspect, mapZohoLead, mapOwnerToSpecialist, agentFromAriaStatus, derivePersonaType, AGENTS, CALLING_WINDOW, OWNER_TO_SPECIALIST };
+module.exports = { createBatchCall, parseProspectList, buildBatchPayload, validateProspect, mapZohoLead, mapZohoRecord, mapOwnerToSpecialist, agentFromAriaStatus, derivePersonaType, AGENTS, CALLING_WINDOW, OWNER_TO_SPECIALIST };

@@ -3392,9 +3392,12 @@ function scheduleRetryTickCron() {
     return;
   }
   cron.schedule(
-    "5 16-20 * * 1-5", // :05 past every hour 16:00-20:00 Mon-Fri Europe/Amsterdam
-                       // (= 10:05-14:05 EDT). Aligns with US East Coast business
-                       // hours window. Hourly (not daily) so Scout leads flipped
+    "5 15-22 * * 1-5", // :05 past every hour 15:00-22:00 Mon-Fri Europe/Amsterdam
+                       // (= 9:05-16:05 EDT). Full US East Coast business hours
+                       // window, including the 2-4pm EDT afternoon prime slot.
+                       // Widened 2026-07-13 from 16-20 CEST after analysis
+                       // showed 49% of manual sweeps hit US East before offices
+                       // opened. Hourly (not daily) so Scout leads flipped
                        // mid-window don't wait a full day. Idempotent via the
                        // in-flight guard in runScoutSweep (Scout_Last_Call_Date
                        // is stamped at dispatch, so subsequent ticks skip).

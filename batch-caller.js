@@ -256,13 +256,15 @@ function agentFromAriaStatus(ariaStatus) {
 // ─── Phone normalisation ─────────────────────────────────────────────────────
 // Converts local/informal phone numbers to E.164 format before validation.
 // Rules applied in order:
-//   1. Already E.164 (starts with +) → keep as-is
+//   1. Already E.164 (starts with +) → strip formatting inside, keep as-is
 //   2. International dialing prefix 00 → replace with +
 //   3. Dutch local format: starts with 0, 9-10 digits → +31 + strip leading 0
-//   4. Otherwise return cleaned string (E.164 validation will catch bad numbers)
+//   4. US format: 11 digits starting with 1 → prepend +
+//   5. US format: 10 digits (typical US) → prepend +1
+//   6. Otherwise return cleaned string (E.164 validation will catch bad numbers)
 function normalizePhone(phone) {
   if (!phone) return "";
-  // Strip whitespace, dashes, dots, parens
+  // Strip whitespace, dashes, dots, parens (works for both "+1 540-665-4538" and "540-665-4538")
   let p = phone.replace(/[\s\-().]/g, "");
   // Already E.164
   if (p.startsWith("+")) return p;
@@ -270,6 +272,10 @@ function normalizePhone(phone) {
   if (p.startsWith("00")) return "+" + p.slice(2);
   // Dutch local format: 0 + 8-9 more digits = 9-10 digit total (mobile: 06XXXXXXXX, landline: 0XX...)
   if (p.startsWith("0") && /^\d{9,10}$/.test(p)) return "+31" + p.slice(1);
+  // US format: 11 digits starting with country code 1 (e.g. "15551234567")
+  if (/^1\d{10}$/.test(p)) return "+" + p;
+  // US format: 10-digit local (area code + number, area code cannot start with 0 or 1)
+  if (/^[2-9]\d{9}$/.test(p)) return "+1" + p;
   // Return cleaned string; validation will flag remaining issues
   return p;
 }

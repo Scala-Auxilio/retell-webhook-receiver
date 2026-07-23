@@ -2675,9 +2675,25 @@ async function runScoutSweep({ dryRun = false } = {}) {
     for (const r of rows) candidates.push({ ...r, _module: mod });
   }
 
-  // Only stuck ones — Scout_Last_Call_Date null means Scout has never called.
-  const stuck = candidates.filter(l => !l.Scout_Last_Call_Date);
-  console.log(`[SCOUT-SWEEP] candidates=${candidates.length} stuck=${stuck.length} (Leads+Contacts) dryRun=${dryRun}`);
+  // Stuck-lead detection. Two flavours:
+  //   (a) Never-dialed: Scout_Last_Call_Date is null → fresh flip that
+  //       Zoho Flow didn't dispatch (e.g. off-hours flip).
+  //   (b) Stale-retry: SLCD populated but > 6 hours old → the retry-cadence
+  //       cohort. Their retry-tick flip back to Ready for Scout didn't lead
+  //       to a Retell call (either Zoho Flow silently dropped it, or the
+  //       flip happened during this same tick and dispatch failed). The
+  //       retry-tick fix (2026-07-24) direct-dispatches now, but this safety
+  //       net catches any leads that fall through anyway.
+  const staleMs = 6 * 60 * 60 * 1000; // 6h
+  const nowMs = Date.now();
+  const stuck = candidates.filter(l => {
+    if (!l.Scout_Last_Call_Date) return true;
+    const slcdMs = Date.parse(l.Scout_Last_Call_Date);
+    return isFinite(slcdMs) && (nowMs - slcdMs) > staleMs;
+  });
+  const neverDialed = stuck.filter(l => !l.Scout_Last_Call_Date).length;
+  const staleRetry = stuck.length - neverDialed;
+  console.log(`[SCOUT-SWEEP] candidates=${candidates.length} stuck=${stuck.length} (never_dialed=${neverDialed} stale_retry=${staleRetry}) (Leads+Contacts) dryRun=${dryRun}`);
 
   if (dryRun || stuck.length === 0) {
     return {
@@ -3484,10 +3500,20 @@ function scheduleRetryTickCron() {
       } catch (err) {
         console.error("[CRON] Scout sweep failed:", err.message);
       }
+      // 2026-07-24: also run Scout retry tick so the retry cadence actually
+      // fires. Previously omitted — retry-tick only fired when someone
+      // manually POSTed /aria/retry-tick, which caused the 327-lead backlog
+      // to accumulate over ~8 days silently.
+      try {
+        const scoutRetry = await runScoutRetryTick({});
+        console.log(`[CRON] Scout retry tick complete: count=${scoutRetry.count || 0} flipped=${scoutRetry.flipped || 0} dispatched=${scoutRetry.dispatched || 0} errors=${scoutRetry.errors || 0}`);
+      } catch (err) {
+        console.error("[CRON] Scout retry tick failed:", err.message);
+      }
     },
     { timezone: "Europe/Amsterdam" }
   );
-  console.log("[CRON] Aria retry tick + Scout sweep scheduled — hourly at :05 from 16:00-20:00 Europe/Amsterdam (Mon-Fri)");
+  console.log("[CRON] Aria retry tick + Scout sweep + Scout retry tick scheduled — hourly at :05 from 15:00-22:00 Europe/Amsterdam (Mon-Fri)");
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────

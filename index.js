@@ -2766,7 +2766,10 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
     .map(s => `(Aria_Status:equals:${s})`)
     .join("or");
   const criteria = `(${statusGroup})`;
-  const fields = "id,First_Name,Last_Name,Aria_Status,Scout_Attempt_Count,Scout_Next_Retry_Date,Country,Educational_Institute";
+  // 2026-07-24: expanded fields so we can directly dispatch after flip
+  // (Zoho Flow was not firing on retry-tick flips — see comment near dispatch
+  // loop below).
+  const fields = "id,First_Name,Last_Name,Email,Phone,Mobile,Company,Account_Name,Aria_Status,Scout_Attempt_Count,Scout_Next_Retry_Date,Country,Educational_Institute,Lead_Source,Industry,Language";
   const modules = ["Leads", "Contacts"];
 
   // 2026-07-13: search both modules. Contacts store Scout_Attempt_Count and
@@ -2846,13 +2849,76 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
     console.log(`[SCOUT-RETRY]   ${l._module}=${l.id} ${l.First_Name || ""} ${l.Last_Name || ""} attempt=${l.Scout_Attempt_Count} due=${l.Scout_Next_Retry_Date} → ${r?.status || "unknown"}${r?.message ? " " + r.message : ""}`);
   });
 
+  // ─── 2026-07-24: direct dispatch after status flip ────────────────────────
+  // Previously, retry-tick relied on Zoho Flow to detect the Aria_Status change
+  // and fire /zoho/aria-trigger. In practice, Zoho Flow does NOT reliably fire
+  // on transitions from "Scout - Attempt N No Answer" → "Ready for Scout"
+  // (verified 2026-07-24: retry-tick flipped 84 leads, zero Retell calls
+  // resulted; 327-lead backlog accumulated over ~8 days).
+  //
+  // Fix: mirror scout_sweep's behaviour and dispatch directly. Stamp SLCD
+  // before dispatch as in-flight guard. Skip leads whose flip PUT failed.
+  let dispatched = 0;
+  let dispatchErrors = 0;
+  const dispatchItems = [];
+  for (const zohoRecord of dueLeads) {
+    const mod = zohoRecord._module;
+    const flipRes = resultsById.get(zohoRecord.id);
+    if (flipRes?.status !== "success") continue; // skip flip-failed leads
+    try {
+      const recordObj = { ...zohoRecord, Aria_Status: SCOUT_RETRY_TARGET_STATUS };
+      const prospect = mapZohoRecord(recordObj, mod);
+      if (!prospect.zoho_record_id) prospect.zoho_record_id = zohoRecord.id;
+      if (!prospect.zoho_lead_id) prospect.zoho_lead_id = zohoRecord.id;
+      if (!prospect.zoho_module) prospect.zoho_module = mod;
+      const errs = validateProspect(prospect, 1);
+      if (errs.length) {
+        console.warn(`[SCOUT-RETRY] dispatch skip ${mod}/${zohoRecord.id}: ${errs.join("; ")}`);
+        dispatchErrors++;
+        dispatchItems.push({ id: zohoRecord.id, module: mod, ok: false, error: errs.join("; ") });
+        continue;
+      }
+      // In-flight guard: stamp SLCD to NOW so scout_sweep won't double-dispatch
+      // if it runs before Retell's write-back completes.
+      const nowIso = new Date().toISOString();
+      const stampRes = await fetch(`${ZOHO_CRM_BASE}/${mod}/${encodeURIComponent(zohoRecord.id)}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ data: [{ Scout_Last_Call_Date: nowIso }] }),
+      });
+      if (!stampRes.ok) {
+        const stampErr = await stampRes.text().catch(() => "");
+        console.warn(`[SCOUT-RETRY] pre-dispatch stamp failed for ${mod}/${zohoRecord.id} (${stampRes.status}): ${stampErr}`);
+        dispatchErrors++;
+        dispatchItems.push({ id: zohoRecord.id, module: mod, ok: false, error: `pre_dispatch_stamp_failed: ${stampRes.status}` });
+        continue;
+      }
+      await createBatchCall([prospect], {
+        agent: "scout_uk",
+        dry_run: false,
+        name: `Scout retry: ${prospect.university_name || "?"} (${mod}/${zohoRecord.id})`,
+      });
+      dispatched++;
+      dispatchItems.push({ id: zohoRecord.id, module: mod, ok: true, university: prospect.university_name });
+      console.log(`[SCOUT-RETRY] dispatched ${mod}/${zohoRecord.id} (${prospect.university_name})`);
+    } catch (err) {
+      dispatchErrors++;
+      dispatchItems.push({ id: zohoRecord.id, module: mod, ok: false, error: err.message });
+      console.warn(`[SCOUT-RETRY] dispatch failed for ${mod}/${zohoRecord.id}: ${err.message}`);
+    }
+  }
+  console.log(`[SCOUT-RETRY] direct-dispatched=${dispatched} dispatch_errors=${dispatchErrors} (of ${flipped} flipped)`);
+
   return {
-    ok: errors === 0,
+    ok: errors === 0 && dispatchErrors === 0,
     dryRun: false,
     today,
     count: dueLeads.length,
     flipped,
     errors,
+    dispatched,
+    dispatch_errors: dispatchErrors,
+    dispatch_items: dispatchItems,
     leads: dueLeads.map((l, idx) => summarize(l, results[idx]?.status === "success" ? SCOUT_RETRY_TARGET_STATUS : `error: ${results[idx]?.message || "unknown"}`)),
   };
 }

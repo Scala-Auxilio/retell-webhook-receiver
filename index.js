@@ -2662,17 +2662,32 @@ async function runScoutSweep({ dryRun = false } = {}) {
   const fields = "id,First_Name,Last_Name,Email,Phone,Mobile,Company,Account_Name,Country,Educational_Institute,Lead_Source,Industry,Language,Scout_Last_Call_Date";
   const modules = ["Leads", "Contacts"];
 
+  // 2026-07-27: paginate Zoho /search — was single-page (200) and would
+  // miss stragglers if >200 leads sit at Ready for Scout in either module.
+  // Mirror the fix applied to runScoutRetryTick.
   const candidates = [];
+  const perPage = 200;
+  const maxPages = 20;
   for (const mod of modules) {
-    const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
-    const qr = await fetch(searchUrl, { headers });
-    if (!qr.ok && qr.status !== 204) {
-      const errText = await qr.text().catch(() => "");
-      throw new Error(`[SCOUT-SWEEP] ${mod} search failed (${qr.status}): ${errText}`);
+    let page = 1;
+    while (page <= maxPages) {
+      const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=${perPage}&page=${page}`;
+      const qr = await fetch(searchUrl, { headers });
+      if (qr.status === 204) break;
+      if (!qr.ok) {
+        const errText = await qr.text().catch(() => "");
+        throw new Error(`[SCOUT-SWEEP] ${mod} search failed page=${page} (${qr.status}): ${errText}`);
+      }
+      const qd = await qr.json();
+      const rows = qd?.data || [];
+      for (const r of rows) candidates.push({ ...r, _module: mod });
+      const info = qd?.info || {};
+      if (!info.more_records || rows.length < perPage) break;
+      page++;
     }
-    const qd = qr.status === 204 ? { data: [] } : await qr.json();
-    const rows = qd?.data || [];
-    for (const r of rows) candidates.push({ ...r, _module: mod });
+    if (page > maxPages) {
+      console.warn(`[SCOUT-SWEEP] ${mod} hit maxPages=${maxPages} — more candidates may exist`);
+    }
   }
 
   // Stuck-lead detection. Two flavours:
@@ -2791,18 +2806,37 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
   // 2026-07-13: search both modules. Contacts store Scout_Attempt_Count and
   // Scout_Next_Retry_Date after the field-parity migration, so retry candidates
   // can arise from either side after conversion.
+  // 2026-07-27: PAGINATE. Zoho's /search returns per_page=200 sorted by id DESC
+  // (newest first). The retry-tick was only ever seeing page 1, which contains
+  // the freshest leads — their retry dates are in the future. Older, actually-
+  // due leads live on pages 2+ and were never fetched. Result: ~232 due leads
+  // piled up; only ~1-5 per tick got dispatched. Fix: loop offset until
+  // more_records=false.
   const allCandidates = [];
+  const perPage = 200;
+  const maxPages = 20; // safety cap: 20 * 200 = 4,000 candidates per module
   for (const mod of modules) {
-    const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200`;
-    const queryRes = await fetch(searchUrl, { headers });
-    if (!queryRes.ok && queryRes.status !== 204) {
-      const errText = await queryRes.text().catch(() => "");
-      throw new Error(`Scout retry ${mod} search failed (${queryRes.status}): ${errText}`);
+    let page = 1;
+    while (page <= maxPages) {
+      const searchUrl = `${ZOHO_CRM_BASE}/${mod}/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=${perPage}&page=${page}`;
+      const queryRes = await fetch(searchUrl, { headers });
+      if (queryRes.status === 204) break; // no records
+      if (!queryRes.ok) {
+        const errText = await queryRes.text().catch(() => "");
+        throw new Error(`Scout retry ${mod} search failed page=${page} (${queryRes.status}): ${errText}`);
+      }
+      const queryData = await queryRes.json();
+      const rows = queryData?.data || [];
+      for (const r of rows) allCandidates.push({ ...r, _module: mod });
+      const info = queryData?.info || {};
+      if (!info.more_records || rows.length < perPage) break;
+      page++;
     }
-    const queryData = queryRes.status === 204 ? { data: [] } : await queryRes.json();
-    const rows = queryData?.data || [];
-    for (const r of rows) allCandidates.push({ ...r, _module: mod });
+    if (page > maxPages) {
+      console.warn(`[SCOUT-RETRY] ${mod} hit maxPages=${maxPages} — more candidates may exist`);
+    }
   }
+  console.log(`[SCOUT-RETRY] total_candidates=${allCandidates.length} (paginated across Leads+Contacts)`);
 
   // Same in-memory filter shape as Aria: due AND attempt cap not exceeded.
   const dueLeads = allCandidates.filter(l => {
@@ -2929,6 +2963,7 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
     ok: errors === 0 && dispatchErrors === 0,
     dryRun: false,
     today,
+    total_candidates: allCandidates.length,
     count: dueLeads.length,
     flipped,
     errors,

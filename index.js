@@ -70,18 +70,25 @@ const AGENT_ID_TO_LABEL = {
 let zohoTokenCache = { token: null, expiresAt: 0 };
 
 // ─── EconoWind Lead Routing Config ──────────────────────────────────────────
+// SINGLE-RECIPIENT ROUTING (set 2026-07-24, per Piet):
+// ALL leads route to Philippe Brands regardless of inferred region.
+// Reason: Willem Stam has left the company; consolidating on one owner avoids
+// leads landing in a departed employee's mailbox. The inferred region is still
+// computed and shown in the alert body/DB so regional routing can be restored
+// later by reverting this block (see retell_backups/index_pre_routing_philippe_20260724.js).
+const ECONOWIND_PRIMARY_MANAGER = { name: "Philippe Brands", email: "brands@econowind.nl" };
 const ECONOWIND_MANAGERS = {
-  "southern_europe": { name: "Willem Stam", email: "stam@econowind.nl", region: "Southern Europe & Turkey" },
-  "turkey":          { name: "Willem Stam", email: "stam@econowind.nl", region: "Southern Europe & Turkey" },
-  "northern_europe": { name: "Stijn Engelage", email: "engelage@econowind.nl", region: "Northern Europe, Americas, ME & Africa" },
-  "americas":        { name: "Stijn Engelage", email: "engelage@econowind.nl", region: "Northern Europe, Americas, ME & Africa" },
-  "middle_east":     { name: "Stijn Engelage", email: "engelage@econowind.nl", region: "Northern Europe, Americas, ME & Africa" },
-  "africa":          { name: "Stijn Engelage", email: "engelage@econowind.nl", region: "Northern Europe, Americas, ME & Africa" },
-  "asia":            { name: "Philippe Brands", email: "brands@econowind.nl", region: "Asia" },
-  "se_asia":         { name: "Naomi Vernimmen", email: "vernimmen@econowind.nl", region: "SE Asia & Singapore" },
-  "singapore":       { name: "Naomi Vernimmen", email: "vernimmen@econowind.nl", region: "SE Asia & Singapore" },
+  "southern_europe": { ...ECONOWIND_PRIMARY_MANAGER, region: "Southern Europe & Turkey" },
+  "turkey":          { ...ECONOWIND_PRIMARY_MANAGER, region: "Southern Europe & Turkey" },
+  "northern_europe": { ...ECONOWIND_PRIMARY_MANAGER, region: "Northern Europe, Americas, ME & Africa" },
+  "americas":        { ...ECONOWIND_PRIMARY_MANAGER, region: "Northern Europe, Americas, ME & Africa" },
+  "middle_east":     { ...ECONOWIND_PRIMARY_MANAGER, region: "Northern Europe, Americas, ME & Africa" },
+  "africa":          { ...ECONOWIND_PRIMARY_MANAGER, region: "Northern Europe, Americas, ME & Africa" },
+  "asia":            { ...ECONOWIND_PRIMARY_MANAGER, region: "Asia" },
+  "se_asia":         { ...ECONOWIND_PRIMARY_MANAGER, region: "SE Asia & Singapore" },
+  "singapore":       { ...ECONOWIND_PRIMARY_MANAGER, region: "SE Asia & Singapore" },
 };
-const ECONOWIND_FALLBACK_MANAGER = { name: "Willem Stam", email: "stam@econowind.nl", region: "Fallback (unmapped region)" };
+const ECONOWIND_FALLBACK_MANAGER = { ...ECONOWIND_PRIMARY_MANAGER, region: "Fallback (unmapped region)" };
 // Also CC Piet on all P1 leads
 const ECONOWIND_CC_P1 = process.env.ECONOWIND_CC_P1 || "petrusc@adsum-auxilio.com";
 // Shared sales inbox CC'd on every real (production) lead alert. Not applied
@@ -91,7 +98,7 @@ const ECONOWIND_CC_SALES = process.env.ECONOWIND_CC_SALES || "sales@econowind.nl
 // this address instead of the region-routed sales manager. Used while the
 // VentoBot widget is in soft-launch / testing so real SMs don't get test alerts.
 // Leave unset (or set to empty string in Railway) to enable production region routing.
-const ALERT_OVERRIDE_TO = process.env.ALERT_OVERRIDE_TO || "engelage@econowind.nl";
+const ALERT_OVERRIDE_TO = process.env.ALERT_OVERRIDE_TO || "";
 
 // SANDBOX MANAGER OVERRIDE: when set, routeToManager() returns this instead of
 // the region-routed manager. The "real" routing decision is preserved in the

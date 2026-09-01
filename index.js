@@ -72,8 +72,8 @@ let zohoTokenCache = { token: null, expiresAt: 0 };
 // ─── EconoWind Lead Routing Config ──────────────────────────────────────────
 // SINGLE-RECIPIENT ROUTING (set 2026-07-24, per Piet):
 // ALL leads route to Philippe Brands regardless of inferred region.
-// Reason: Willem Stam has left the company; consolidating on one owner avoids
-// leads landing in a departed employee's mailbox. The inferred region is still
+// Reason: the previous Southern Europe / fallback owner left the company;
+// consolidating on one owner avoids leads landing in a dormant mailbox. The inferred region is still
 // computed and shown in the alert body/DB so regional routing can be restored
 // later by reverting this block (see retell_backups/index_pre_routing_philippe_20260724.js).
 const ECONOWIND_PRIMARY_MANAGER = { name: "Philippe Brands", email: "brands@econowind.nl" };
@@ -104,8 +104,8 @@ const ALERT_OVERRIDE_TO = process.env.ALERT_OVERRIDE_TO || "";
 // the region-routed manager. The "real" routing decision is preserved in the
 // returned region string so the email body still reflects what would have
 // happened in production. Useful during sandbox to hide individual managers
-// (e.g. Willem) and surface a single point-of-contact (e.g. Stijn) regardless
-// of region. Leave both unset for normal regional routing.
+// and surface a single point-of-contact regardless of region.
+// Leave both unset for normal regional routing.
 const SANDBOX_MANAGER_NAME = process.env.SANDBOX_MANAGER_NAME || null;
 const SANDBOX_MANAGER_EMAIL = process.env.SANDBOX_MANAGER_EMAIL || null;
 

@@ -549,7 +549,7 @@ async function runScorerSweep({ pool, hoursBack = 24, agentIds = ["agent_aa56b68
     }
     const reqBody = {
       limit: PAGE_LIMIT,
-      filter_criteria: { agent_id: agentIds, start_timestamp: { lower_threshold: since } },
+      filter_criteria: { agent_id: agentIds, start_timestamp: { type: "number", op: "ge", value: since } },
       sort_order: "descending",
     };
     if (paginationKey) reqBody.pagination_key = paginationKey;

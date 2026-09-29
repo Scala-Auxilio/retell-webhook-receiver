@@ -1384,9 +1384,7 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   // at today+attempt days, cap at 3 total → park at Scout - Max Attempts.
   let scoutStatus;
   let scoutRetryFields = {}; // populated only on the retry path
-  if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
-  else if (disposition === "bad_number") scoutStatus = "Scout - Bad Number";
-  else if (SCOUT_NO_ANSWER_DISPOSITIONS.has(disposition)) {
+  if (SCOUT_NO_ANSWER_DISPOSITIONS.has(disposition)) {
     const currentCount = await fetchScoutAttemptCount(zohoRecordId, zohoModule);
     const newCount = currentCount + 1;
     if (newCount >= 3) {
@@ -1406,7 +1404,23 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
     }
     console.log(`  [SCOUT] No-answer flow | attempt: ${newCount} | status: ${scoutStatus} | retry: ${scoutRetryFields.Scout_Next_Retry_Date || "(parked)"}`);
   }
-  else scoutStatus = "Scout - No Contact"; // human reached but nothing given (refused / wrong org)
+  else {
+    // Terminal outcome: a human answered, or the line is dead.
+    // 2026-09-29: count EVERY Scout attempt, not only no-answers, and clear the
+    // retry date. Before this, Scout_Attempt_Count stayed blank when the first
+    // call reached a human, and a lead that went Attempt 1 No Answer -> human
+    // reached kept its stale Scout_Next_Retry_Date on a terminal status (the
+    // 2026-08-25 "185 overdue retries" phantom). Safe for retry-tick: it only
+    // selects SCOUT_RETRY_PENDING_STATUSES, so terminal records are never retried.
+    const currentCount = await fetchScoutAttemptCount(zohoRecordId, zohoModule);
+    scoutRetryFields = {
+      Scout_Attempt_Count:   currentCount + 1,
+      Scout_Next_Retry_Date: null,
+    };
+    if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
+    else if (disposition === "bad_number") scoutStatus = "Scout - Bad Number";
+    else scoutStatus = "Scout - No Contact"; // human reached but nothing given (refused / wrong org)
+  }
 
   const notes = [
     summary,

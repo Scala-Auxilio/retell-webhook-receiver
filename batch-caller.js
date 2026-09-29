@@ -52,6 +52,7 @@ const AGENTS = {
     // agent regardless of the number binding. (Remove this once Scout has its own
     // dedicated DID bound to the Scout agent.)
     force_agent_override: true,
+    daily_phone_dedupe: true,
   },
   // Scout US — same Scout agent, dials from the US DID (+1 507 577 5551).
   // The US DID is bound to the Aria agent in Retell, so we need the same
@@ -63,6 +64,7 @@ const AGENTS = {
     label: "Scout US (Sendsteps)",
     from_number: process.env.SCOUT_US_FROM_NUMBER || process.env.ARIA_EN_FROM_NUMBER || null,
     force_agent_override: true,
+    daily_phone_dedupe: true,
   },
 };
 
@@ -365,8 +367,100 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
 
 // ─── API call ───────────────────────────────────────────────────────────────
 
+// ─── Scout: one dial per phone number per day ───────────────────────────────
+// 2026-09-29: the Scout sweep, retry tick and Zoho trigger each dispatch per
+// LEAD, so leads that share one switchboard number were dialled several times
+// on the same day (21 numbers, 44 calls, 31 Aug to 28 Sep). The guard lives
+// here because createBatchCall is the one chokepoint all three paths share.
+// "Today" is the Europe/Amsterdam calendar day (all Scout dialling happens
+// 15:00-22:00 Amsterdam, which is the same US calendar day).
+// Source of truth is Retell's own call log for the agent, re-read at most every
+// 30 minutes (so deploys, restarts and manual dials are covered), plus an
+// in-process set that is updated BEFORE each dispatch.
+// If the Retell check fails we do NOT dial (fail closed); the lead stays in
+// "Ready for Scout" and the next sweep picks it up.
+const DEDUPE_TZ = "Europe/Amsterdam";
+const DEDUPE_RESEED_MS = 30 * 60 * 1000;
+const _dialled = { day: null, sets: new Map(), seededAt: new Map() }; // agentId -> Set(to_number) / ms
+
+function amsterdamDayAndMidnight(now = new Date()) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: DEDUPE_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+    }).formatToParts(now).map(p => [p.type, p.value])
+  );
+  const day = `${parts.year}-${parts.month}-${parts.day}`;
+  const sinceMidnightMs = ((Number(parts.hour) * 60 + Number(parts.minute)) * 60 + Number(parts.second)) * 1000 + now.getMilliseconds();
+  return { day, midnightMs: now.getTime() - sinceMidnightMs };
+}
+
+async function fetchNumbersDialledSince(agentId, sinceMs) {
+  const numbers = new Set();
+  let paginationKey = null;
+  for (let page = 0; page < 20; page++) {
+    const body = {
+      filter_criteria: { agent_id: [agentId], start_timestamp: { type: "number", op: "ge", value: sinceMs } },
+      limit: 1000,
+    };
+    if (paginationKey) body.pagination_key = paginationKey;
+    const r = await fetch(`${RETELL_API_BASE}/v3/list-calls`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${RETELL_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`Retell list-calls ${r.status}: ${t.slice(0, 200)}`);
+    }
+    const d = await r.json();
+    const items = Array.isArray(d) ? d : (d.items || []);
+    for (const c of items) if (c.to_number) numbers.add(c.to_number);
+    if (!d.has_more || !d.pagination_key || items.length === 0) break;
+    paginationKey = d.pagination_key;
+  }
+  return numbers;
+}
+
+// Returns true if the caller may dial toNumber now (and reserves it for today),
+// false if this agent already dialled it today. Throws if Retell can't be read.
+async function claimDailyDial(agentId, toNumber) {
+  const { day, midnightMs } = amsterdamDayAndMidnight();
+  if (_dialled.day !== day) {
+    _dialled.day = day;
+    _dialled.sets = new Map();
+    _dialled.seededAt = new Map();
+  }
+  // Create the set synchronously so concurrent callers share one instance.
+  if (!_dialled.sets.has(agentId)) _dialled.sets.set(agentId, new Set());
+  const set = _dialled.sets.get(agentId);
+  if (Date.now() - (_dialled.seededAt.get(agentId) || 0) > DEDUPE_RESEED_MS) {
+    const fromRetell = await fetchNumbersDialledSince(agentId, midnightMs);
+    for (const n of fromRetell) set.add(n);
+    _dialled.seededAt.set(agentId, Date.now());
+  }
+  if (set.has(toNumber)) return false;
+  set.add(toNumber);
+  return true;
+}
+
+function releaseDailyDial(agentId, toNumber) {
+  const set = _dialled.sets.get(agentId);
+  if (set) set.delete(toNumber);
+}
+
 async function createBatchCall(prospects, options = {}) {
-  const agentKey = options.agent || "aria_en";
+  let agentKey = options.agent || "aria_en";
+
+  // 2026-09-29: the Scout sweep and retry tick pass "scout_uk" unconditionally,
+  // so 758 of 769 Scout calls to +1 numbers (31 Aug to 28 Sep) went out with
+  // the UK mobile caller ID. Route by destination instead: North American
+  // numbers (+1, US and Canada) dial from the US DID.
+  if (agentKey === "scout_uk" && prospects.length > 0 &&
+      prospects.every(p => String(p.phone_number || "").startsWith("+1"))) {
+    agentKey = "scout_us";
+    console.log(`[ROUTING] +1 destination: scout_uk -> scout_us (caller ID ${AGENTS.scout_us.from_number})`);
+  }
 
   // Validate all prospects
   const allErrors = [];
@@ -376,6 +470,14 @@ async function createBatchCall(prospects, options = {}) {
   }
 
   const payload = buildBatchPayload(prospects, agentKey, options);
+
+  // Standing rule (Petrus, 2026-09-29): North American (+1) numbers are ALWAYS
+  // dialled from a +1 caller ID, for every agent. Refuse rather than fall back
+  // to a UK or NL number (e.g. if the US DID env var is ever missing).
+  if (payload.tasks.some(t => String(t.to_number || "").startsWith("+1")) &&
+      !String(payload.from_number || "").startsWith("+1")) {
+    throw new Error(`Refusing to dial +1 number(s) from non-US caller ID ${payload.from_number || "(none)"} (agent ${agentKey})`);
+  }
 
   if (options.dry_run) {
     return {
@@ -402,7 +504,23 @@ async function createBatchCall(prospects, options = {}) {
   // override_agent_id, which the per-call endpoint honours.
   if (AGENTS[agentKey].force_agent_override) {
     const callIds = [];
+    const skippedDuplicate = [];
+    const agentId = AGENTS[agentKey].agent_id;
+    const dedupe = !!AGENTS[agentKey].daily_phone_dedupe;
     for (const task of payload.tasks) {
+      if (dedupe) {
+        let allowed;
+        try {
+          allowed = await claimDailyDial(agentId, task.to_number);
+        } catch (e) {
+          throw new Error(`Daily dedupe check failed, not dialling ${task.to_number}: ${e.message}`);
+        }
+        if (!allowed) {
+          console.log(`[SCOUT-DEDUPE] ${task.to_number} already dialled today (${_dialled.day} Amsterdam), deferred`);
+          skippedDuplicate.push(task.to_number);
+          continue;
+        }
+      }
       const callResp = await fetch(`${RETELL_API_BASE}/v2/create-phone-call`, {
         method: "POST",
         headers: {
@@ -417,6 +535,7 @@ async function createBatchCall(prospects, options = {}) {
         }),
       });
       if (!callResp.ok) {
+        if (dedupe) releaseDailyDial(agentId, task.to_number); // Retell refused: no call was placed
         const err = await callResp.json().catch(() => ({}));
         throw new Error(`Retell API error ${callResp.status}: ${JSON.stringify(err)}`);
       }
@@ -427,7 +546,8 @@ async function createBatchCall(prospects, options = {}) {
       success: true,
       call_ids: callIds,
       agent: AGENTS[agentKey].label,
-      total_calls: payload.tasks.length,
+      total_calls: callIds.length,
+      skipped_duplicate: skippedDuplicate,
       override_agent_id: AGENTS[agentKey].agent_id,
     };
   }

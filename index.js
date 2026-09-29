@@ -2743,7 +2743,7 @@ async function runScoutSweep({ dryRun = false } = {}) {
     };
   }
 
-  let dispatched = 0, errors = 0;
+  let dispatched = 0, errors = 0, deferred = 0;
   const items = [];
   for (const zohoRecord of stuck) {
     const mod = zohoRecord._module;
@@ -2780,11 +2780,19 @@ async function runScoutSweep({ dryRun = false } = {}) {
         items.push({ id: zohoRecord.id, module: mod, ok: false, error: `pre_dispatch_stamp_failed: ${stampRes.status}` });
         continue;
       }
-      await createBatchCall([prospect], {
-        agent: "scout_uk",
+      const sweepResult = await createBatchCall([prospect], {
+        agent: "scout_uk", // createBatchCall promotes +1 numbers to scout_us
         dry_run: false,
         name: `Scout sweep: ${prospect.university_name || "?"} (${mod}/${zohoRecord.id})`,
       });
+      if (sweepResult?.skipped_duplicate?.length) {
+        // Same switchboard already dialled today (another lead). Lead stays in
+        // "Ready for Scout"; the SLCD stamp above makes a later sweep retry it.
+        deferred++;
+        items.push({ id: zohoRecord.id, module: mod, ok: true, deferred: "number_dialled_today", university: prospect.university_name });
+        console.log(`[SCOUT-SWEEP] deferred ${mod}/${zohoRecord.id} (${prospect.university_name}): ${prospect.phone_number} already dialled today`);
+        continue;
+      }
       dispatched++;
       items.push({ id: zohoRecord.id, module: mod, ok: true, university: prospect.university_name });
       console.log(`[SCOUT-SWEEP] dispatched ${mod}/${zohoRecord.id} (${prospect.university_name})`);
@@ -2794,7 +2802,7 @@ async function runScoutSweep({ dryRun = false } = {}) {
       console.warn(`[SCOUT-SWEEP] dispatch failed for ${mod}/${zohoRecord.id}: ${err.message}`);
     }
   }
-  return { ok: true, dryRun, count: stuck.length, dispatched, errors, items };
+  return { ok: true, dryRun, count: stuck.length, dispatched, deferred, errors, items };
 }
 
 // ─── Scout retry tick — mirrors Aria's runRetryTick ─────────────────────────
@@ -2931,6 +2939,7 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
   // before dispatch as in-flight guard. Skip leads whose flip PUT failed.
   let dispatched = 0;
   let dispatchErrors = 0;
+  let dispatchDeferred = 0;
   const dispatchItems = [];
   for (const zohoRecord of dueLeads) {
     const mod = zohoRecord._module;
@@ -2964,11 +2973,17 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
         dispatchItems.push({ id: zohoRecord.id, module: mod, ok: false, error: `pre_dispatch_stamp_failed: ${stampRes.status}` });
         continue;
       }
-      await createBatchCall([prospect], {
-        agent: "scout_uk",
+      const retryResult = await createBatchCall([prospect], {
+        agent: "scout_uk", // createBatchCall promotes +1 numbers to scout_us
         dry_run: false,
         name: `Scout retry: ${prospect.university_name || "?"} (${mod}/${zohoRecord.id})`,
       });
+      if (retryResult?.skipped_duplicate?.length) {
+        dispatchDeferred++;
+        dispatchItems.push({ id: zohoRecord.id, module: mod, ok: true, deferred: "number_dialled_today", university: prospect.university_name });
+        console.log(`[SCOUT-RETRY] deferred ${mod}/${zohoRecord.id} (${prospect.university_name}): ${prospect.phone_number} already dialled today`);
+        continue;
+      }
       dispatched++;
       dispatchItems.push({ id: zohoRecord.id, module: mod, ok: true, university: prospect.university_name });
       console.log(`[SCOUT-RETRY] dispatched ${mod}/${zohoRecord.id} (${prospect.university_name})`);
@@ -2978,7 +2993,7 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
       console.warn(`[SCOUT-RETRY] dispatch failed for ${mod}/${zohoRecord.id}: ${err.message}`);
     }
   }
-  console.log(`[SCOUT-RETRY] direct-dispatched=${dispatched} dispatch_errors=${dispatchErrors} (of ${flipped} flipped)`);
+  console.log(`[SCOUT-RETRY] direct-dispatched=${dispatched} deferred_same_number=${dispatchDeferred} dispatch_errors=${dispatchErrors} (of ${flipped} flipped)`);
 
   return {
     ok: errors === 0 && dispatchErrors === 0,
@@ -2989,6 +3004,7 @@ async function runScoutRetryTick({ dryRun = false } = {}) {
     flipped,
     errors,
     dispatched,
+    dispatch_deferred: dispatchDeferred,
     dispatch_errors: dispatchErrors,
     dispatch_items: dispatchItems,
     leads: dueLeads.map((l, idx) => summarize(l, results[idx]?.status === "success" ? SCOUT_RETRY_TARGET_STATUS : `error: ${results[idx]?.message || "unknown"}`)),
@@ -3281,6 +3297,19 @@ app.post("/zoho/aria-trigger", requireAuth, async (req, res) => {
       name: `Zoho → Aria: ${prospect.university_name} (${prospect.zoho_lead_id})`,
     });
 
+    if (result?.skipped_duplicate?.length) {
+      // Scout only: this switchboard was already dialled today for another
+      // lead. The lead stays in "Ready for Scout"; the hourly sweep retries it.
+      console.log(`  [SCOUT-DEDUPE] deferred ${prospect.zoho_lead_id} (${prospect.university_name}): ${prospect.phone_number} already dialled today`);
+      return res.json({
+        success: true,
+        deferred: "number_dialled_today",
+        zoho_lead_id: prospect.zoho_lead_id,
+        agent: agentKey,
+        university: prospect.university_name,
+      });
+    }
+
     // Log to database
     await pool.query(
       `INSERT INTO notifications (subject, body, priority, source, status)
@@ -3552,7 +3581,7 @@ function scheduleRetryTickCron() {
       // dispatched. Non-fatal — failures logged but don't block the cron.
       try {
         const sweep = await runScoutSweep({});
-        console.log(`[CRON] Scout sweep complete: candidates=${sweep.candidates || 0} dispatched=${sweep.dispatched || 0} errors=${sweep.errors || 0}`);
+        console.log(`[CRON] Scout sweep complete: stuck=${sweep.count || 0} dispatched=${sweep.dispatched || 0} deferred=${sweep.deferred || 0} errors=${sweep.errors || 0}`);
       } catch (err) {
         console.error("[CRON] Scout sweep failed:", err.message);
       }
@@ -3562,7 +3591,7 @@ function scheduleRetryTickCron() {
       // to accumulate over ~8 days silently.
       try {
         const scoutRetry = await runScoutRetryTick({});
-        console.log(`[CRON] Scout retry tick complete: count=${scoutRetry.count || 0} flipped=${scoutRetry.flipped || 0} dispatched=${scoutRetry.dispatched || 0} errors=${scoutRetry.errors || 0}`);
+        console.log(`[CRON] Scout retry tick complete: count=${scoutRetry.count || 0} flipped=${scoutRetry.flipped || 0} dispatched=${scoutRetry.dispatched || 0} deferred=${scoutRetry.dispatch_deferred || 0} errors=${scoutRetry.errors || 0}`);
       } catch (err) {
         console.error("[CRON] Scout retry tick failed:", err.message);
       }

@@ -8,6 +8,7 @@ const odooProxy = require("./odoo-proxy");
 const { createBatchCall, validateProspect, mapZohoLead, mapZohoRecord, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 const analyst = require("./intelligence-analyst");
 const sendsteps = require("./sendsteps-chat");
+const { SCOUT_OUTCOME_STATUS, cleanEmail, cleanPhone, scoutOutcome } = require("./scout-outcome");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -1333,10 +1334,23 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   const zohoRecordId = dynVars.zoho_record_id || dynVars.zoho_lead_id || null;
   const cad = (callAnalysis && callAnalysis.custom_analysis_data) || {};
 
-  const email = String(cad.scout_captured_email || "").trim();
-  const name  = String(cad.scout_captured_name  || "").trim();
-  const role  = String(cad.scout_captured_role  || "").trim();
-  const phone = String(cad.scout_captured_phone || "").trim();
+  // Scout v3 (2026-10-14): validate captures, prefer the v3 contact fields,
+  // and read scout_outcome. Raw values that fail validation are noted, not written.
+  const rawEmail = String(cad.scout_captured_email || "").trim();
+  const rawPhone = String(cad.scout_captured_phone || "").trim();
+  const email = cleanEmail(rawEmail);
+  const phone = cleanPhone(rawPhone);
+  const name  = String(cad.scout_contact_name  || cad.scout_captured_name || "").trim();
+  const role  = String(cad.scout_contact_title || cad.scout_captured_role || "").trim();
+  const outcome    = scoutOutcome(cad);
+  const v3Status   = SCOUT_OUTCOME_STATUS[outcome] || null; // null for no_person / missing / unknown
+  const department = String(cad.scout_department || "").trim();
+  const givenBy    = String(cad.scout_given_by || "").trim();
+  const scoutNote  = String(cad.scout_note || "").trim();
+  const rejected = [
+    rawEmail && !email ? `Rejected email (invalid or own domain): ${rawEmail}` : null,
+    rawPhone && !phone ? `Rejected phone (under 10 digits): ${rawPhone}` : null,
+  ].filter(Boolean);
   let disposition = String(cad.call_outcome || cad.call_disposition || "").trim().toLowerCase();
 
   // Fallback disposition from the connection state when no analysis is present
@@ -1372,7 +1386,7 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   // no_answer and let the retry cycle catch them.
   const notInServiceRegex = /(?:number|line) you (?:have )?dial(?:ed|led)|(?:no longer|not) (?:in service|in use)|has been (?:disconnected|changed)|(?:not|no longer)(?: a)? working number|number (?:has been )?disconnected|wrong number|non-?working|out of service|reached a non-working|number is disconnected/i;
   const isNotInServiceRecording = notInServiceRegex.test(transcriptText) || notInServiceRegex.test(summary);
-  if (disposition !== "contact_captured" && (isEchoTest || isNotInServiceRecording)) {
+  if (!v3Status && disposition !== "contact_captured" && (isEchoTest || isNotInServiceRecording)) {
     const why = isEchoTest ? "echo/test line" : "not-in-service recording";
     console.log(`  [SCOUT] bad-number detected: ${why} (${durationSec}s)`);
     disposition = "bad_number";
@@ -1384,7 +1398,8 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
   // at today+attempt days, cap at 3 total → park at Scout - Max Attempts.
   let scoutStatus;
   let scoutRetryFields = {}; // populated only on the retry path
-  if (SCOUT_NO_ANSWER_DISPOSITIONS.has(disposition)) {
+  // A v3 outcome means a person was reached, so it is always terminal.
+  if (!v3Status && SCOUT_NO_ANSWER_DISPOSITIONS.has(disposition)) {
     const currentCount = await fetchScoutAttemptCount(zohoRecordId, zohoModule);
     const newCount = currentCount + 1;
     if (newCount >= 3) {
@@ -1417,7 +1432,8 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
       Scout_Attempt_Count:   currentCount + 1,
       Scout_Next_Retry_Date: null,
     };
-    if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
+    if (v3Status) scoutStatus = v3Status;
+    else if (disposition === "contact_captured") scoutStatus = "Scout - Contact Captured";
     else if (disposition === "bad_number") scoutStatus = "Scout - Bad Number";
     else scoutStatus = "Scout - No Contact"; // human reached but nothing given (refused / wrong org)
   }
@@ -1428,6 +1444,11 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
     name  ? `Contact: ${name}` : null,
     role  ? `Role: ${role}` : null,
     phone ? `Direct phone (stored, NOT auto-dialled): ${phone}` : null,
+    department ? `Department: ${department}` : null,
+    givenBy ? `Given by: ${givenBy}` : null,
+    scoutNote ? `Note: ${scoutNote}` : null,
+    ...rejected,
+    outcome ? `Scout outcome: ${outcome}` : null,
     `Scout disposition: ${disposition}`,
     `Duration: ${durationSec}s`,
   ].filter(Boolean).join(". ");
@@ -1474,10 +1495,22 @@ async function handleScoutCallEnded(callData, callAnalysis, callId, agentLabel, 
     `INSERT INTO notifications (subject, body, priority, source, status)
      VALUES ($1, $2, 'normal', 'scout_call_ended', 'sent')`,
     [
-      `Scout ${disposition}: ${name || "contact"} (${email || "no email"})`,
-      JSON.stringify({ zoho_module: zohoModule, zoho_record_id: zohoRecordId, record_id: crmResult && crmResult.recordId, disposition, scout_status: scoutStatus, email, name, role, phone, call_id: callId, agent: agentLabel, duration_sec: durationSec }),
+      `Scout ${outcome || disposition}: ${name || "contact"} (${email || "no email"})`,
+      JSON.stringify({ zoho_module: zohoModule, zoho_record_id: zohoRecordId, record_id: crmResult && crmResult.recordId, disposition, outcome, scout_status: scoutStatus, email, name, role, phone, department, call_id: callId, agent: agentLabel, duration_sec: durationSec }),
     ]
   ).catch(() => {});
+
+  // Interested lead: Petrus follows up personally (decided 2026-10-14).
+  if (outcome === "confirmed_interested") {
+    await pool.query(
+      `INSERT INTO notifications (subject, body, priority, source, status)
+       VALUES ($1, $2, 'high', 'scout_interested', 'sent')`,
+      [
+        `Scout: ${name || "contact"} at ${dynVars.university_name || "university"} is interested. Petrus to follow up`,
+        JSON.stringify({ zoho_module: zohoModule, zoho_record_id: zohoRecordId, name, role, email, phone, university: dynVars.university_name || "", summary, call_id: callId }),
+      ]
+    ).catch(() => {});
+  }
 }
 
 async function handleAriaCallEnded(callData, callAnalysis, callId, agentLabel, receivedAt) {

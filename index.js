@@ -9,6 +9,7 @@ const { createBatchCall, validateProspect, mapZohoLead, mapZohoRecord, agentFrom
 const analyst = require("./intelligence-analyst");
 const sendsteps = require("./sendsteps-chat");
 const { SCOUT_OUTCOME_STATUS, cleanEmail, cleanPhone, scoutOutcome } = require("./scout-outcome");
+const { makeRequireAuth, secretMatches } = require("./auth");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -523,14 +524,9 @@ app.use(
 );
 
 // ─── Auth middleware (reusable across protected endpoints) ────────────────────
-function requireAuth(req, res, next) {
-  if (!NOTIFY_SECRET) return next(); // no secret configured, allow all
-  const auth = req.headers["x-notify-secret"] || req.body.secret;
-  if (auth !== NOTIFY_SECRET) {
-    return res.status(401).json({ error: "Invalid or missing secret" });
-  }
-  next();
-}
+// Fails closed (503) when NOTIFY_SECRET is unset, compares in constant time.
+// See auth.js.
+const requireAuth = makeRequireAuth(NOTIFY_SECRET);
 
 
 // ─── VentoBot Sandbox: public test page for the sales team ──────────────────
@@ -2159,7 +2155,7 @@ app.get("/events", async (req, res) => {
     // Without auth, the response is metadata-only — preserves existing
     // monitoring access (e.g. Paperclip heartbeat) while protecting visitor PII.
     const auth = req.headers["x-notify-secret"];
-    const authenticated = NOTIFY_SECRET && auth === NOTIFY_SECRET;
+    const authenticated = secretMatches(auth, NOTIFY_SECRET);
     const events = authenticated
       ? result.rows
       : result.rows.map(row => ({
@@ -2524,7 +2520,7 @@ scorer.registerRoutes(app, pool, { requireAuth });
 analyst.registerAnalystRoutes(app, { pool, sendEmail, requireAuth });
 
 // ─── Odoo CRM Proxy (pipeline monitoring for Paperclip agents) ──────────────
-odooProxy.registerRoutes(app, pool);
+odooProxy.registerRoutes(app, pool, { requireAuth });
 
 // ─── Chat-Aria (Sendsteps) — book_demo tool endpoint ────────────────────────
 sendsteps.registerRoutes(app, { sendEmail, NOTIFY_FROM, NOTIFY_SECRET });

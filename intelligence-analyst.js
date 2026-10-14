@@ -498,7 +498,9 @@ Expected impact: ${proposal.expected_impact}
 }
 
 // ─── Express routes (manual triggers + status) ─────────────────────────────
-function registerAnalystRoutes(app, { pool, sendEmail, requireAuth = (req, res, next) => next() }) {
+function registerAnalystRoutes(app, { pool, sendEmail, requireAuth }) {
+  // No default: registering these routes without auth must fail loudly, not open them.
+  if (typeof requireAuth !== "function") throw new Error("intelligence-analyst registerAnalystRoutes: requireAuth is required");
   // POST /analyst/digest-now — manual trigger for weekly digest
   app.post("/analyst/digest-now", requireAuth, async (req, res) => {
     try {

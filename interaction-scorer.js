@@ -647,14 +647,16 @@ async function initScorerTable(pool) {
 
 // ─── Express route handlers ─────────────────────────────────────────────────
 
-function registerRoutes(app, pool, { requireAuth = (req, res, next) => next() } = {}) {
+function registerRoutes(app, pool, { requireAuth } = {}) {
+  // No default: registering these routes without auth must fail loudly, not open them.
+  if (typeof requireAuth !== "function") throw new Error("interaction-scorer registerRoutes: requireAuth is required");
   // ─── Auto-scoring endpoint (LLM-driven) ──────────────────────────────────
   // POST /scorer/auto-score
   //   Body: { call_id: "call_xxx", force?: bool }
   //   Fetches the call from Retell, scores it with Claude Haiku 4.5, writes
   //   the result to interaction_scores. Idempotent: returns existing score
   //   if already scored unless force=true.
-  app.post("/scorer/auto-score", async (req, res) => {
+  app.post("/scorer/auto-score", requireAuth, async (req, res) => {
     try {
       const { call_id, force } = req.body || {};
       if (!call_id) return res.status(400).json({ error: "Missing call_id" });
@@ -708,7 +710,7 @@ function registerRoutes(app, pool, { requireAuth = (req, res, next) => next() } 
    *   limit      - Max calls to return (default: 10)
    *   agent_type - "aria" or "econowind" (filters by agent_id)
    */
-  app.get("/scorer/unscored", async (req, res) => {
+  app.get("/scorer/unscored", requireAuth, async (req, res) => {
     try {
       const limit = Math.min(parseInt(req.query.limit) || 10, 50);
       const agentType = (req.query.agent_type || "").toLowerCase();
@@ -767,7 +769,7 @@ function registerRoutes(app, pool, { requireAuth = (req, res, next) => next() } 
    *   flags            - Array of flags (e.g., ["gdpr_disclosure_missing", "rushed_closing"])
    *   notes            - Free-text notes
    */
-  app.post("/scorer/score", async (req, res) => {
+  app.post("/scorer/score", requireAuth, async (req, res) => {
     try {
       const { call_id, agent_id, agent_type, dimension_scores, outcome, flags, notes } = req.body;
 

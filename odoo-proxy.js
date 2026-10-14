@@ -692,10 +692,12 @@ async function sendReportEmail(report, htmlBody) {
 
 // ─── Route Registration ────────────────────────────────────────────
 
-function registerRoutes(app, pool) {
+function registerRoutes(app, pool, { requireAuth } = {}) {
+  // Every /odoo/* route returns or changes pipeline data: all of them need the secret.
+  if (typeof requireAuth !== 'function') throw new Error('odoo-proxy registerRoutes: requireAuth is required');
 
   // Health check / connectivity test
-  app.get('/odoo/status', async (req, res) => {
+  app.get('/odoo/status', requireAuth, async (req, res) => {
     try {
       if (!ODOO_LOGIN || !ODOO_API_KEY) {
         return res.json({
@@ -711,7 +713,7 @@ function registerRoutes(app, pool) {
   });
 
   // Current pipeline snapshot (raw data)
-  app.get('/odoo/pipeline-snapshot', async (req, res) => {
+  app.get('/odoo/pipeline-snapshot', requireAuth, async (req, res) => {
     try {
       const uid = await odooAuthenticate();
       const opportunities = await fetchActiveOpportunities(uid);
@@ -728,7 +730,7 @@ function registerRoutes(app, pool) {
   });
 
   // Full weekly report (JSON)
-  app.get('/odoo/pipeline-report', async (req, res) => {
+  app.get('/odoo/pipeline-report', requireAuth, async (req, res) => {
     try {
       const uid = await odooAuthenticate();
       const report = await generateWeeklyReport(uid, pool);
@@ -748,7 +750,7 @@ function registerRoutes(app, pool) {
   });
 
   // Full weekly report (HTML preview)
-  app.get('/odoo/pipeline-report/preview', async (req, res) => {
+  app.get('/odoo/pipeline-report/preview', requireAuth, async (req, res) => {
     try {
       const uid = await odooAuthenticate();
       const report = await generateWeeklyReport(uid, pool);
@@ -762,7 +764,7 @@ function registerRoutes(app, pool) {
   });
 
   // Save current snapshot for future WoW comparison
-  app.post('/odoo/snapshot/save', async (req, res) => {
+  app.post('/odoo/snapshot/save', requireAuth, async (req, res) => {
     try {
       const uid = await odooAuthenticate();
       const opportunities = await fetchActiveOpportunities(uid);

@@ -4,7 +4,8 @@
   "description": "Lightweight webhook receiver for Retell AI events \u2014 writes to Paperclip's PostgreSQL",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test tests/auth.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

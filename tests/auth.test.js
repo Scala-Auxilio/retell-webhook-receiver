@@ -176,6 +176,79 @@ describe("secret unset or empty: fail closed", () => {
   }
 });
 
+describe("recon counts with chat and call events", () => {
+  const { foldEventCounts } = require("../recon");
+  const ECONOWIND = "agent_760482429951f50e816c47b55a";
+  const ARIA = "agent_aa56b68b02f6de4ac5725a829b";
+
+  test("foldEventCounts adds chat_* and call_* into started/ended/analyzed", () => {
+    const folded = foldEventCounts([
+      { agent_id: ECONOWIND, event_type: "chat_started", n: "4" },
+      { agent_id: ECONOWIND, event_type: "chat_ended", n: "3" },
+      { agent_id: ECONOWIND, event_type: "chat_analyzed", n: "2" },
+      { agent_id: ARIA, event_type: "call_started", n: "1" },
+      { agent_id: ARIA, event_type: "call_ended", n: "1" },
+      { agent_id: ARIA, event_type: "call_analyzed", n: "1" },
+      { agent_id: ARIA, event_type: "call_ended", n: "2" },
+      { agent_id: ARIA, event_type: "something_else", n: "5" },
+    ]);
+    // Sorted by agent_id: digits come before letters, so EconoWind is first.
+    assert.deepEqual(folded, [
+      { agent_id: ECONOWIND, events: 9, started: 4, ended: 3, analyzed: 2, other: 0 },
+      { agent_id: ARIA, events: 10, started: 1, ended: 3, analyzed: 1, other: 5 },
+    ]);
+    assert.deepEqual(foldEventCounts([]), []);
+  });
+
+  // A pool that answers the three recon queries with EconoWind chat data,
+  // so the route is checked end to end on the response shape.
+  const chatPool = {
+    async query(sql) {
+      if (/GROUP BY agent_id, event_type/.test(sql)) {
+        return { rows: [
+          { agent_id: ECONOWIND, event_type: "chat_started", n: "4" },
+          { agent_id: ECONOWIND, event_type: "chat_ended", n: "3" },
+          { agent_id: ECONOWIND, event_type: "chat_analyzed", n: "2" },
+        ] };
+      }
+      if (/COUNT\(DISTINCT call_id\) AS distinct_calls/.test(sql)) {
+        return { rows: [{ agent_id: ECONOWIND, distinct_calls: "4", calls_with_transcript: "3" }] };
+      }
+      if (/JOIN interaction_scores/.test(sql)) {
+        return { rows: [{ agent_id: ECONOWIND, scored_calls: "2" }] };
+      }
+      if (/FROM notifications/.test(sql)) {
+        return { rows: [{ sent: "1", failed: "0" }] };
+      }
+      return { rows: [] };
+    },
+  };
+
+  test("GET /recon/counts reports EconoWind chat events as started/ended/analyzed", async () => {
+    const express = require("express");
+    const { makeRequireAuth } = require("../auth");
+    const app = express();
+    require("../recon").registerRoutes(app, chatPool, { requireAuth: makeRequireAuth(SECRET) });
+    const server = await new Promise((r) => { const s = app.listen(0, "127.0.0.1", () => r(s)); });
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const r = await call(base, "GET", "/recon/counts?since=2026-10-27T00:00:00Z&until=2026-10-28T00:00:00Z", null, { "x-notify-secret": SECRET });
+      assert.equal(r.status, 200, r.text);
+      const body = JSON.parse(r.text);
+      assert.deepEqual(body.agents, [{
+        agent_id: ECONOWIND, events: 9, started: 4, ended: 3, analyzed: 2, other: 0,
+        distinct_calls: 4, calls_with_transcript: 3, scored_calls: 2,
+      }]);
+      assert.deepEqual(body.totals, { events: 9, distinct_calls: 4, scored_calls: 2 });
+      assert.deepEqual(body.notifications, { sent: 1, failed: 0 });
+      assert.deepEqual(body.window, { since: "2026-10-27T00:00:00.000Z", until: "2026-10-28T00:00:00.000Z" });
+      assert.equal((await call(base, "GET", "/recon/counts")).status, 401);
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+});
+
 describe("secretMatches", () => {
   const { secretMatches } = require("../auth");
   test("true only for the exact string", () => {

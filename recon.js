@@ -21,6 +21,33 @@ function parseWindow(query = {}) {
 
 const int = (v) => parseInt(v, 10) || 0;
 
+// Voice agents emit call_started/call_ended/call_analyzed; chat agents (for
+// example EconoWind) emit chat_started/chat_ended/chat_analyzed. The Checker
+// does not care which, so both families fold into started/ended/analyzed.
+const STARTED = new Set(["call_started", "chat_started"]);
+const ENDED = new Set(["call_ended", "chat_ended"]);
+const ANALYZED = new Set(["call_analyzed", "chat_analyzed"]);
+
+// rows: [{ agent_id, event_type, n }] → one entry per agent, sorted by agent_id:
+//   { agent_id, events, started, ended, analyzed, other }
+// `other` holds event types outside the three families, so
+// events = started + ended + analyzed + other always holds.
+function foldEventCounts(rows) {
+  const byAgent = new Map();
+  for (const r of rows) {
+    const key = r.agent_id ?? null;
+    const a = byAgent.get(key) || { agent_id: key, events: 0, started: 0, ended: 0, analyzed: 0, other: 0 };
+    const n = int(r.n);
+    a.events += n;
+    if (STARTED.has(r.event_type)) a.started += n;
+    else if (ENDED.has(r.event_type)) a.ended += n;
+    else if (ANALYZED.has(r.event_type)) a.analyzed += n;
+    else a.other += n;
+    byAgent.set(key, a);
+  }
+  return [...byAgent.values()].sort((x, y) => String(x.agent_id).localeCompare(String(y.agent_id)));
+}
+
 function registerRoutes(app, pool, { requireAuth } = {}) {
   // No default: registering these routes without auth must fail loudly, not open them.
   if (typeof requireAuth !== "function") throw new Error("recon registerRoutes: requireAuth is required");
@@ -29,28 +56,32 @@ function registerRoutes(app, pool, { requireAuth } = {}) {
    * GET /recon/counts?since=<ISO>&until=<ISO>
    *
    * Per Retell agent id, within [since, until):
-   *   events, call_started, call_ended, call_analyzed, distinct_calls,
-   *   calls_with_transcript, scored_calls (distinct call ids that have a row
-   *   in interaction_scores, whenever that row was written)
+   *   events, started, ended, analyzed (call_* and chat_* counted together),
+   *   other (any other event type), distinct_calls, calls_with_transcript,
+   *   scored_calls (distinct call ids that have a row in interaction_scores,
+   *   whenever that row was written)
    * Plus notifications sent and failed in the window.
    */
   app.get("/recon/counts", requireAuth, async (req, res) => {
     const w = parseWindow(req.query);
     if (w.error) return res.status(400).json({ error: w.error });
     try {
-      const events = await pool.query(`
+      const byType = await pool.query(`
+        SELECT agent_id, event_type, COUNT(*) AS n
+        FROM retell_events
+        WHERE received_at >= $1 AND received_at < $2
+        GROUP BY agent_id, event_type
+      `, [w.since, w.until]);
+
+      const calls = await pool.query(`
         SELECT agent_id,
-               COUNT(*)                                             AS events,
-               COUNT(*) FILTER (WHERE event_type = 'call_started')  AS call_started,
-               COUNT(*) FILTER (WHERE event_type = 'call_ended')    AS call_ended,
-               COUNT(*) FILTER (WHERE event_type = 'call_analyzed') AS call_analyzed,
-               COUNT(DISTINCT call_id)                              AS distinct_calls,
+               COUNT(DISTINCT call_id) AS distinct_calls,
                COUNT(DISTINCT call_id) FILTER (WHERE transcript IS NOT NULL AND transcript <> '') AS calls_with_transcript
         FROM retell_events
         WHERE received_at >= $1 AND received_at < $2
         GROUP BY agent_id
-        ORDER BY agent_id
       `, [w.since, w.until]);
+      const callsByAgent = new Map(calls.rows.map(r => [r.agent_id ?? null, r]));
 
       const scored = await pool.query(`
         SELECT e.agent_id, COUNT(DISTINCT e.call_id) AS scored_calls
@@ -59,7 +90,7 @@ function registerRoutes(app, pool, { requireAuth } = {}) {
         WHERE e.received_at >= $1 AND e.received_at < $2
         GROUP BY e.agent_id
       `, [w.since, w.until]);
-      const scoredByAgent = new Map(scored.rows.map(r => [r.agent_id, int(r.scored_calls)]));
+      const scoredByAgent = new Map(scored.rows.map(r => [r.agent_id ?? null, int(r.scored_calls)]));
 
       const notifications = await pool.query(`
         SELECT COUNT(*) FILTER (WHERE status = 'sent')   AS sent,
@@ -69,16 +100,15 @@ function registerRoutes(app, pool, { requireAuth } = {}) {
       `, [w.since, w.until]);
       const n = notifications.rows[0] || {};
 
-      const agents = events.rows.map(r => ({
-        agent_id: r.agent_id,
-        events: int(r.events),
-        call_started: int(r.call_started),
-        call_ended: int(r.call_ended),
-        call_analyzed: int(r.call_analyzed),
-        distinct_calls: int(r.distinct_calls),
-        calls_with_transcript: int(r.calls_with_transcript),
-        scored_calls: scoredByAgent.get(r.agent_id) || 0,
-      }));
+      const agents = foldEventCounts(byType.rows).map(a => {
+        const c = callsByAgent.get(a.agent_id) || {};
+        return {
+          ...a,
+          distinct_calls: int(c.distinct_calls),
+          calls_with_transcript: int(c.calls_with_transcript),
+          scored_calls: scoredByAgent.get(a.agent_id) || 0,
+        };
+      });
 
       res.json({
         window: { since: w.since.toISOString(), until: w.until.toISOString() },
@@ -142,4 +172,4 @@ function registerRoutes(app, pool, { requireAuth } = {}) {
   });
 }
 
-module.exports = { registerRoutes, parseWindow };
+module.exports = { registerRoutes, parseWindow, foldEventCounts };

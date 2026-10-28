@@ -1,4 +1,4 @@
-// Auth on the protected scorer and Odoo routes. Run: npm test
+// Auth on the protected scorer, recon and Odoo routes. Run: npm test
 // No network beyond 127.0.0.1, no database, no real data: a fake pool, a fake
 // Odoo JSON-RPC server and a made-up secret.
 "use strict";
@@ -51,11 +51,13 @@ async function startApp(secret, log = () => {}) {
   const express = require("express");
   const { makeRequireAuth } = require("../auth");
   const scorer = require("../interaction-scorer");
+  const recon = require("../recon");
   const odooProxy = require("../odoo-proxy");
   const app = express();
   app.use(express.json());
   const requireAuth = makeRequireAuth(secret, { log });
   scorer.registerRoutes(app, fakePool, { requireAuth });
+  recon.registerRoutes(app, fakePool, { requireAuth });
   odooProxy.registerRoutes(app, fakePool, { requireAuth });
   const server = await new Promise((r) => { const s = app.listen(0, "127.0.0.1", () => r(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -66,6 +68,11 @@ const PROTECTED = [
   ["GET", "/scorer/unscored"],
   ["POST", "/scorer/score", { call_id: "call_test_1", agent_type: "aria", dimension_scores: {}, outcome: "test" }],
   ["POST", "/scorer/auto-score", { call_id: "call_test_1" }],
+  ["GET", "/scorer/scores"],
+  ["GET", "/scorer/summary"],
+  ["GET", "/recon/counts"],
+  ["GET", "/recon/counts?since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z"],
+  ["GET", "/recon/scores-by-source"],
   ["GET", "/odoo/status"],
   ["GET", "/odoo/pipeline-snapshot"],
   ["GET", "/odoo/pipeline-report"],
@@ -117,12 +124,34 @@ describe("secret set", () => {
     assert.ok(odooCalls > 0);
   });
 
-  // Not locked in this change: they return no transcript, phone number or name.
-  for (const route of ["/scorer/rubric", "/scorer/scores", "/scorer/summary"]) {
-    test(`GET ${route} stays open (unchanged)`, async () => {
-      assert.equal((await call(app.base, "GET", route)).status, 200);
-    });
-  }
+  // The rubric is a static document with no client data; it stays open.
+  test("GET /scorer/rubric stays open", async () => {
+    assert.equal((await call(app.base, "GET", "/scorer/rubric")).status, 200);
+  });
+
+  test("GET /recon/counts answers counts only, for a default 24h window", async () => {
+    const r = await call(app.base, "GET", "/recon/counts", null, { "x-notify-secret": SECRET });
+    assert.equal(r.status, 200, r.text);
+    const body = JSON.parse(r.text);
+    assert.deepEqual(Object.keys(body).sort(), ["agents", "notifications", "totals", "window"]);
+    assert.deepEqual(body.totals, { events: 0, distinct_calls: 0, scored_calls: 0 });
+    assert.deepEqual(body.notifications, { sent: 0, failed: 0 });
+    const ms = new Date(body.window.until) - new Date(body.window.since);
+    assert.equal(ms, 24 * 60 * 60 * 1000);
+  });
+
+  test("GET /recon/counts rejects a bad or oversized window with 400", async () => {
+    const h = { "x-notify-secret": SECRET };
+    assert.equal((await call(app.base, "GET", "/recon/counts?since=yesterday", null, h)).status, 400);
+    assert.equal((await call(app.base, "GET", "/recon/counts?since=2026-10-02T00:00:00Z&until=2026-10-01T00:00:00Z", null, h)).status, 400);
+    assert.equal((await call(app.base, "GET", "/recon/counts?since=2026-01-01T00:00:00Z&until=2026-03-01T00:00:00Z", null, h)).status, 400);
+  });
+
+  test("GET /recon/scores-by-source covers all time without a window", async () => {
+    const r = await call(app.base, "GET", "/recon/scores-by-source", null, { "x-notify-secret": SECRET });
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(JSON.parse(r.text), { window: "all", total: 0, sources: [] });
+  });
 });
 
 describe("secret unset or empty: fail closed", () => {
@@ -147,6 +176,79 @@ describe("secret unset or empty: fail closed", () => {
   }
 });
 
+describe("recon counts with chat and call events", () => {
+  const { foldEventCounts } = require("../recon");
+  const ECONOWIND = "agent_760482429951f50e816c47b55a";
+  const ARIA = "agent_aa56b68b02f6de4ac5725a829b";
+
+  test("foldEventCounts adds chat_* and call_* into started/ended/analyzed", () => {
+    const folded = foldEventCounts([
+      { agent_id: ECONOWIND, event_type: "chat_started", n: "4" },
+      { agent_id: ECONOWIND, event_type: "chat_ended", n: "3" },
+      { agent_id: ECONOWIND, event_type: "chat_analyzed", n: "2" },
+      { agent_id: ARIA, event_type: "call_started", n: "1" },
+      { agent_id: ARIA, event_type: "call_ended", n: "1" },
+      { agent_id: ARIA, event_type: "call_analyzed", n: "1" },
+      { agent_id: ARIA, event_type: "call_ended", n: "2" },
+      { agent_id: ARIA, event_type: "something_else", n: "5" },
+    ]);
+    // Sorted by agent_id: digits come before letters, so EconoWind is first.
+    assert.deepEqual(folded, [
+      { agent_id: ECONOWIND, events: 9, started: 4, ended: 3, analyzed: 2, other: 0 },
+      { agent_id: ARIA, events: 10, started: 1, ended: 3, analyzed: 1, other: 5 },
+    ]);
+    assert.deepEqual(foldEventCounts([]), []);
+  });
+
+  // A pool that answers the three recon queries with EconoWind chat data,
+  // so the route is checked end to end on the response shape.
+  const chatPool = {
+    async query(sql) {
+      if (/GROUP BY agent_id, event_type/.test(sql)) {
+        return { rows: [
+          { agent_id: ECONOWIND, event_type: "chat_started", n: "4" },
+          { agent_id: ECONOWIND, event_type: "chat_ended", n: "3" },
+          { agent_id: ECONOWIND, event_type: "chat_analyzed", n: "2" },
+        ] };
+      }
+      if (/COUNT\(DISTINCT call_id\) AS distinct_calls/.test(sql)) {
+        return { rows: [{ agent_id: ECONOWIND, distinct_calls: "4", calls_with_transcript: "3" }] };
+      }
+      if (/JOIN interaction_scores/.test(sql)) {
+        return { rows: [{ agent_id: ECONOWIND, scored_calls: "2" }] };
+      }
+      if (/FROM notifications/.test(sql)) {
+        return { rows: [{ sent: "1", failed: "0" }] };
+      }
+      return { rows: [] };
+    },
+  };
+
+  test("GET /recon/counts reports EconoWind chat events as started/ended/analyzed", async () => {
+    const express = require("express");
+    const { makeRequireAuth } = require("../auth");
+    const app = express();
+    require("../recon").registerRoutes(app, chatPool, { requireAuth: makeRequireAuth(SECRET) });
+    const server = await new Promise((r) => { const s = app.listen(0, "127.0.0.1", () => r(s)); });
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const r = await call(base, "GET", "/recon/counts?since=2026-10-27T00:00:00Z&until=2026-10-28T00:00:00Z", null, { "x-notify-secret": SECRET });
+      assert.equal(r.status, 200, r.text);
+      const body = JSON.parse(r.text);
+      assert.deepEqual(body.agents, [{
+        agent_id: ECONOWIND, events: 9, started: 4, ended: 3, analyzed: 2, other: 0,
+        distinct_calls: 4, calls_with_transcript: 3, scored_calls: 2,
+      }]);
+      assert.deepEqual(body.totals, { events: 9, distinct_calls: 4, scored_calls: 2 });
+      assert.deepEqual(body.notifications, { sent: 1, failed: 0 });
+      assert.deepEqual(body.window, { since: "2026-10-27T00:00:00.000Z", until: "2026-10-28T00:00:00.000Z" });
+      assert.equal((await call(base, "GET", "/recon/counts")).status, 401);
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+});
+
 describe("secretMatches", () => {
   const { secretMatches } = require("../auth");
   test("true only for the exact string", () => {
@@ -165,9 +267,10 @@ describe("secretMatches", () => {
 });
 
 describe("route modules refuse to register without auth", () => {
-  test("interaction-scorer, odoo-proxy and intelligence-analyst throw instead of opening routes", () => {
+  test("interaction-scorer, recon, odoo-proxy and intelligence-analyst throw instead of opening routes", () => {
     const express = require("express");
     assert.throws(() => require("../interaction-scorer").registerRoutes(express(), fakePool), /requireAuth is required/);
+    assert.throws(() => require("../recon").registerRoutes(express(), fakePool), /requireAuth is required/);
     assert.throws(() => require("../odoo-proxy").registerRoutes(express(), fakePool), /requireAuth is required/);
     assert.throws(() => require("../intelligence-analyst").registerAnalystRoutes(express(), { pool: fakePool }), /requireAuth is required/);
   });
@@ -181,13 +284,16 @@ describe("index.js wiring", () => {
     assert.doesNotMatch(src, /function requireAuth\(/);
     assert.doesNotMatch(src, /if \(!NOTIFY_SECRET\) return next\(\)/);
   });
-  test("the scorer, analyst and Odoo routes get requireAuth", () => {
+  test("the scorer, recon, analyst and Odoo routes get requireAuth", () => {
     assert.match(src, /scorer\.registerRoutes\(app, pool, \{ requireAuth \}\)/);
+    assert.match(src, /recon\.registerRoutes\(app, pool, \{ requireAuth \}\)/);
     assert.match(src, /analyst\.registerAnalystRoutes\(app, \{ pool, sendEmail, requireAuth \}\)/);
     assert.match(src, /odooProxy\.registerRoutes\(app, pool, \{ requireAuth \}\)/);
   });
-  test("GET /events and GET /stats are not locked by this change", () => {
-    assert.match(src, /app\.get\("\/events", async/);
-    assert.match(src, /app\.get\("\/stats", async/);
+  test("GET /events and GET /stats require the secret, with no redaction branch left", () => {
+    assert.match(src, /app\.get\("\/events", requireAuth, async/);
+    assert.match(src, /app\.get\("\/stats", requireAuth, async/);
+    assert.doesNotMatch(src, /metadata-only/);
+    assert.doesNotMatch(src, /secretMatches/);
   });
 });

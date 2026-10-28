@@ -827,7 +827,7 @@ function registerRoutes(app, pool, { requireAuth } = {}) {
    *   since      - ISO date (default: 7 days ago)
    *   limit      - Max results (default: 50)
    */
-  app.get("/scorer/scores", async (req, res) => {
+  app.get("/scorer/scores", requireAuth, async (req, res) => {
     try {
       const limit = Math.min(parseInt(req.query.limit) || 50, 200);
       const since = req.query.since || new Date(Date.now() - 7 * 86400000).toISOString();
@@ -880,7 +880,7 @@ function registerRoutes(app, pool, { requireAuth } = {}) {
    * Query:
    *   period - "day", "week", "month" (default: "week")
    */
-  app.get("/scorer/summary", async (req, res) => {
+  app.get("/scorer/summary", requireAuth, async (req, res) => {
     try {
       const period = req.query.period || "week";
       const daysBack = period === "day" ? 1 : period === "month" ? 30 : 7;

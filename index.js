@@ -4,12 +4,13 @@ const cron = require("node-cron");
 const { Pool } = require("pg");
 const calendly = require("./calendly");
 const scorer = require("./interaction-scorer");
+const recon = require("./recon");
 const odooProxy = require("./odoo-proxy");
 const { createBatchCall, validateProspect, mapZohoLead, mapZohoRecord, agentFromAriaStatus, AGENTS } = require("./batch-caller");
 const analyst = require("./intelligence-analyst");
 const sendsteps = require("./sendsteps-chat");
 const { SCOUT_OUTCOME_STATUS, cleanEmail, cleanPhone, scoutOutcome } = require("./scout-outcome");
-const { makeRequireAuth, secretMatches } = require("./auth");
+const { makeRequireAuth } = require("./auth");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -2104,8 +2105,8 @@ app.get("/notifications", requireAuth, async (req, res) => {
   }
 });
 
-// ─── Stats endpoint (useful for Paperclip agents) ────────────────────────────
-app.get("/stats", async (_req, res) => {
+// ─── Stats endpoint (for Paperclip agents; needs x-notify-secret) ────────────
+app.get("/stats", requireAuth, async (_req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -2124,8 +2125,8 @@ app.get("/stats", async (_req, res) => {
   }
 });
 
-// ─── Events query endpoint (for Paperclip agents to pull recent events) ──────
-app.get("/events", async (req, res) => {
+// ─── Events query endpoint (for Paperclip agents; needs x-notify-secret) ─────
+app.get("/events", requireAuth, async (req, res) => {
   try {
     const { agent_id, event_type, since, limit = 100 } = req.query;
     let query = "SELECT * FROM retell_events WHERE 1=1";
@@ -2150,28 +2151,9 @@ app.get("/events", async (req, res) => {
 
     const result = await pool.query(query, params);
 
-    // PII protection: full payloads (transcripts, analysis, raw payload) are
-    // returned only when the request carries a valid x-notify-secret header.
-    // Without auth, the response is metadata-only — preserves existing
-    // monitoring access (e.g. Paperclip heartbeat) while protecting visitor PII.
-    const auth = req.headers["x-notify-secret"];
-    const authenticated = secretMatches(auth, NOTIFY_SECRET);
-    const events = authenticated
-      ? result.rows
-      : result.rows.map(row => ({
-          id: row.id,
-          event_type: row.event_type,
-          agent_id: row.agent_id,
-          call_id: row.call_id,
-          received_at: row.received_at,
-          transcript: row.transcript ? "[REDACTED — provide x-notify-secret for full access]" : null,
-          call_analysis: row.call_analysis ? { redacted: true } : null,
-        }));
-    res.json({
-      count: events.length,
-      events,
-      ...(authenticated ? {} : { access: "metadata-only" }),
-    });
+    // requireAuth already checked x-notify-secret, so full rows (transcripts,
+    // analysis, payload) go only to callers that hold the secret.
+    res.json({ count: result.rows.length, events: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2517,6 +2499,7 @@ calendly.registerRoutes(app, { sendEmail });
 
 // ─── Interaction Scorer (call quality scoring for Paperclip agents) ─────────
 scorer.registerRoutes(app, pool, { requireAuth });
+recon.registerRoutes(app, pool, { requireAuth });
 analyst.registerAnalystRoutes(app, { pool, sendEmail, requireAuth });
 
 // ─── Odoo CRM Proxy (pipeline monitoring for Paperclip agents) ──────────────

@@ -15,6 +15,9 @@
 
 const fs = require("fs");
 const path = require("path");
+// 2026-10-29 learning-loop fixes D1-D3: local office hours, holidays,
+// unresolved variables, dead-end switchboards. See dial-rules.js.
+const dialRules = require("./dial-rules");
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const RETELL_API_KEY = process.env.RETELL_API_KEY || null;
@@ -293,6 +296,10 @@ function validateProspect(prospect, index) {
   if (!prospect.phone_number) errors.push(`Row ${index}: missing phone_number`);
   else if (!validateE164(prospect.phone_number)) errors.push(`Row ${index}: invalid E.164 format '${prospect.phone_number}' — must be +[country][number]`);
   if (!prospect.university_name && !prospect.contact_name) errors.push(`Row ${index}: need at least university_name or contact_name`);
+  // 2026-10-29 (D2): never dial with a template variable left unresolved.
+  for (const [k, v] of Object.entries(prospect)) {
+    if (typeof v === "string" && /\{\{|\}\}/.test(v)) errors.push(`Row ${index}: ${k} contains an unresolved template variable`);
+  }
   return errors;
 }
 
@@ -347,7 +354,15 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
 
   // Add calling window
   if (!options.skip_window) {
-    payload.call_time_window = {
+    // 2026-10-29 (D1): use the destination's time zone when all numbers share
+    // one (Retell applies the window in that zone); 09:00-16:30 local.
+    const zones = [...new Set(tasks.map(t => dialRules.timeZoneForPhone(t.to_number)))];
+    const localWindow = zones.length === 1;
+    if (!localWindow) console.warn(`[DIAL-RULES] mixed destination time zones (${zones.join(", ")}): falling back to ${CALLING_WINDOW.timezone} window`);
+    payload.call_time_window = localWindow ? {
+      timezone: zones[0],
+      windows: [1, 2, 3, 4, 5].map(day => ({ day: [day], start: dialRules.WINDOW_START_MIN, end: dialRules.WINDOW_END_MIN })),
+    } : {
       timezone: CALLING_WINDOW.timezone,
       windows: CALLING_WINDOW.windows.map((w) => ({
         day: [w.day],
@@ -444,6 +459,30 @@ async function claimDailyDial(agentId, toNumber) {
   return true;
 }
 
+// 2026-10-29 (D3): recent dead ends for one number. Fails OPEN (allows the
+// dial) if Retell can't be read, because this is an optimisation, not a guard.
+async function deadEndCheck(agentId, toNumber) {
+  if (!RETELL_API_KEY) return { deadEnds: 0, blocked: false };
+  try {
+    const sinceMs = Date.now() - dialRules.DEAD_END_LOOKBACK_DAYS * 86400000;
+    const r = await fetch(`${RETELL_API_BASE}/v3/list-calls`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${RETELL_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filter_criteria: { agent_id: [agentId], to_number: [toNumber], start_timestamp: { type: "number", op: "ge", value: sinceMs } },
+        limit: 100,
+      }),
+    });
+    if (!r.ok) throw new Error(`list-calls ${r.status}`);
+    const d = await r.json();
+    const items = (Array.isArray(d) ? d : (d.items || [])).filter(c => c.to_number === toNumber);
+    return dialRules.deadEndVerdict(items);
+  } catch (e) {
+    console.warn(`[DIAL-RULES] dead-end check failed for ${toNumber}, allowing dial: ${e.message}`);
+    return { deadEnds: 0, blocked: false };
+  }
+}
+
 function releaseDailyDial(agentId, toNumber) {
   const set = _dialled.sets.get(agentId);
   if (set) set.delete(toNumber);
@@ -468,6 +507,13 @@ async function createBatchCall(prospects, options = {}) {
   if (allErrors.length > 0) {
     return { success: false, errors: allErrors };
   }
+  // 2026-10-29 (D2): agent-specific fields the agent speaks aloud must be filled.
+  const varErrors = [];
+  prospects.forEach((p, i) => dialRules.variableProblems(p, agentKey).forEach(e => varErrors.push(`Row ${i + 1}: ${e}`)));
+  if (varErrors.length > 0) {
+    console.warn(`[DIAL-RULES] refusing ${agentKey} dispatch: ${varErrors.join("; ")}`);
+    return { success: false, errors: varErrors };
+  }
 
   const payload = buildBatchPayload(prospects, agentKey, options);
 
@@ -486,7 +532,7 @@ async function createBatchCall(prospects, options = {}) {
       agent: AGENTS[agentKey].label,
       total_calls: payload.tasks.length,
       from_number: payload.from_number,
-      calling_window: payload.call_time_window ? "Mon-Fri 09:00-17:00 CET" : "None (immediate)",
+      calling_window: payload.call_time_window ? `Mon-Fri ${payload.call_time_window.timezone}` : "None (immediate)",
       scheduled: options.scheduled_time || "Now",
       sample_task: payload.tasks[0],
       full_payload: payload,
@@ -505,9 +551,34 @@ async function createBatchCall(prospects, options = {}) {
   if (AGENTS[agentKey].force_agent_override) {
     const callIds = [];
     const skippedDuplicate = [];
+    const skippedOutsideHours = [];
+    const skippedDeadEnd = [];
     const agentId = AGENTS[agentKey].agent_id;
     const dedupe = !!AGENTS[agentKey].daily_phone_dedupe;
     for (const task of payload.tasks) {
+      // 2026-10-29 (D1): only dial inside the destination's local office hours
+      // (Mon-Fri 09:00-16:30, no public holidays). Deferred numbers are also
+      // listed in skipped_duplicate so existing callers treat them as deferred
+      // (lead stays "Ready for Scout"; the sweep retries it on a later tick).
+      if (!options.skip_window) {
+        const win = dialRules.callingWindowCheck(task.to_number);
+        if (!win.ok) {
+          console.log(`[DIAL-RULES] ${task.to_number} deferred: ${win.reason}`);
+          skippedOutsideHours.push(task.to_number);
+          skippedDuplicate.push(task.to_number);
+          continue;
+        }
+      }
+      // 2026-10-29 (D3): stop redialling a switchboard that keeps dead-ending.
+      if (dedupe) {
+        const verdict = await deadEndCheck(agentId, task.to_number);
+        if (verdict.blocked) {
+          console.log(`[DIAL-RULES] ${task.to_number} deferred: ${verdict.deadEnds} phone-menu/no-person dead ends in ${dialRules.DEAD_END_LOOKBACK_DAYS} days`);
+          skippedDeadEnd.push(task.to_number);
+          skippedDuplicate.push(task.to_number);
+          continue;
+        }
+      }
       if (dedupe) {
         let allowed;
         try {
@@ -548,6 +619,8 @@ async function createBatchCall(prospects, options = {}) {
       agent: AGENTS[agentKey].label,
       total_calls: callIds.length,
       skipped_duplicate: skippedDuplicate,
+      skipped_outside_hours: skippedOutsideHours,
+      skipped_dead_end: skippedDeadEnd,
       override_agent_id: AGENTS[agentKey].agent_id,
     };
   }

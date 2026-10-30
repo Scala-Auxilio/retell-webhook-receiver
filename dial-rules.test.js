@@ -37,3 +37,19 @@ assert.deepStrictEqual(r.deadEndVerdict([menu, menu, ok]), { deadEnds: 2, blocke
 assert.deepStrictEqual(r.deadEndVerdict([menu, menu, menu]), { deadEnds: 3, blocked: true });
 assert.strictEqual(r.isDeadEndCall({ disconnection_reason: "max_duration_reached" }), true);
 console.log("dial-rules: all tests passed");
+
+// ---- D5 per-number dial cap (2026-10-30) ----
+{
+  const now = Date.UTC(2026, 9, 30, 12);
+  const day = 86400000;
+  const mk = (daysAgo, reason) => ({ start_timestamp: now - daysAgo * day, disconnection_reason: reason });
+  const r1 = r.dialCapVerdict([mk(1, 'user_hangup'), mk(3, 'dial_no_answer')], now);
+  assert.strictEqual(r1.dials, 2); assert.strictEqual(r1.blocked, false);
+  const r2 = r.dialCapVerdict([mk(1, 'user_hangup'), mk(3, 'dial_no_answer'), mk(13, 'voicemail_reached')], now);
+  assert.strictEqual(r2.dials, 3); assert.strictEqual(r2.blocked, true);
+  const r3 = r.dialCapVerdict([mk(1, 'user_hangup'), mk(3, 'dial_no_answer'), mk(15, 'voicemail_reached')], now);
+  assert.strictEqual(r3.blocked, false, 'older than 14 days does not count');
+  const r4 = r.dialCapVerdict([mk(1, 'dial_failed'), mk(2, 'invalid_destination'), mk(3, 'error_unknown'), mk(4, 'agent_hangup')], now);
+  assert.strictEqual(r4.dials, 1, 'failed dials do not count');
+  console.log('D5 dial cap: ok');
+}

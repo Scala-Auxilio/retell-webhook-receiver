@@ -11,6 +11,8 @@
  *     "{{...}}" or a field the agent speaks aloud is empty.
  *   - D3 Dead-end switchboards: helper to decide whether a number has hit a
  *     phone-menu dead end / no person often enough to stop redialling it.
+ *   - D5 (30 Oct) Per-number cap: at most 3 real dials per number per 14 days,
+ *     across all leads and agents (shared switchboards).
  *
  * Time zones for +1 numbers are approximated from the area code (default
  * America/New_York). Pure functions, no network, unit-tested in
@@ -161,7 +163,25 @@ function deadEndVerdict(calls) {
   return { deadEnds, blocked: deadEnds >= DEAD_END_LIMIT };
 }
 
+/** D5 (2026-10-30): per-number dial cap across ALL leads and agents.
+ * Several leads often share one switchboard; each was dialled on its own retry
+ * cycle (one number: 9 dials in 11 days). Cap real dial attempts per number. */
+const DIAL_CAP = 3;
+const DIAL_CAP_DAYS = 14;
+const NOT_A_DIAL = new Set(["dial_failed", "invalid_destination", "telephony_provider_unavailable", "concurrency_limit_reached"]);
+function isRealDial(call) {
+  const reason = String(call?.disconnection_reason || "").toLowerCase();
+  if (call?.call_status === "error" || reason.startsWith("error")) return false;
+  return !NOT_A_DIAL.has(reason);
+}
+function dialCapVerdict(calls, now = Date.now()) {
+  const since = now - DIAL_CAP_DAYS * 86400000;
+  const dials = (calls || []).filter(c => (c.start_timestamp || 0) >= since && isRealDial(c)).length;
+  return { dials, blocked: dials >= DIAL_CAP };
+}
+
 module.exports = {
   timeZoneForPhone, callingWindowCheck, variableProblems, isDeadEndCall, deadEndVerdict,
   usHolidays, ukHolidays, DEAD_END_LIMIT, DEAD_END_LOOKBACK_DAYS, WINDOW_START_MIN, WINDOW_END_MIN,
+  isRealDial, dialCapVerdict, DIAL_CAP, DIAL_CAP_DAYS,
 };

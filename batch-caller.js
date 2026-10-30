@@ -19,7 +19,7 @@ const path = require("path");
 // unresolved variables, dead-end switchboards. See dial-rules.js.
 const dialRules = require("./dial-rules");
 
-// ─── Config ─────────────────────────────────────────────────────────────────
+// ─── Config ─────────────────────────────────────────────────────────────────────────
 const RETELL_API_KEY = process.env.RETELL_API_KEY || null;
 const RETELL_API_BASE = "https://api.retellai.com";
 
@@ -285,7 +285,7 @@ function normalizePhone(phone) {
   return p;
 }
 
-// ─── Validation ─────────────────────────────────────────────────────────────
+// ─── Validation ──────────────────────────────────────────────────────────────
 
 function validateE164(phone) {
   return /^\+[1-9]\d{6,14}$/.test(phone);
@@ -380,7 +380,7 @@ function buildBatchPayload(prospects, agentKey, options = {}) {
   return payload;
 }
 
-// ─── API call ───────────────────────────────────────────────────────────────
+// ─── API call ───────────────────────────────────────────────────────────────────────
 
 // ─── Scout: one dial per phone number per day ───────────────────────────────
 // 2026-09-29: the Scout sweep, retry tick and Zoho trigger each dispatch per
@@ -459,27 +459,35 @@ async function claimDailyDial(agentId, toNumber) {
   return true;
 }
 
-// 2026-10-29 (D3): recent dead ends for one number. Fails OPEN (allows the
-// dial) if Retell can't be read, because this is an optimisation, not a guard.
-async function deadEndCheck(agentId, toNumber) {
-  if (!RETELL_API_KEY) return { deadEnds: 0, blocked: false };
+// 2026-10-29 (D3) + 2026-10-30 (D5): one read of a number's recent calls gives
+// both the dead-end verdict (this agent, 7 days) and the per-number dial cap
+// (all agents, 14 days). Fails OPEN (allows the dial) if Retell can't be read.
+async function numberHistoryCheck(agentId, toNumber) {
+  const open = { deadEnds: 0, blocked: false, dials: 0, capBlocked: false };
+  if (!RETELL_API_KEY) return open;
   try {
-    const sinceMs = Date.now() - dialRules.DEAD_END_LOOKBACK_DAYS * 86400000;
+    const lookbackDays = Math.max(dialRules.DEAD_END_LOOKBACK_DAYS, dialRules.DIAL_CAP_DAYS);
+    const sinceMs = Date.now() - lookbackDays * 86400000;
     const r = await fetch(`${RETELL_API_BASE}/v3/list-calls`, {
       method: "POST",
       headers: { "Authorization": `Bearer ${RETELL_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        filter_criteria: { agent_id: [agentId], to_number: [toNumber], start_timestamp: { type: "number", op: "ge", value: sinceMs } },
-        limit: 100,
+        // Retell v3 list-calls: to_number must be a string filter object (an array is rejected with 400,
+        // verified 30 Oct 2026), otherwise this check would always fail open.
+        filter_criteria: { to_number: { type: "string", op: "eq", value: toNumber }, start_timestamp: { type: "number", op: "ge", value: sinceMs } },
+        limit: 200,
       }),
     });
     if (!r.ok) throw new Error(`list-calls ${r.status}`);
     const d = await r.json();
     const items = (Array.isArray(d) ? d : (d.items || [])).filter(c => c.to_number === toNumber);
-    return dialRules.deadEndVerdict(items);
+    const deadSince = Date.now() - dialRules.DEAD_END_LOOKBACK_DAYS * 86400000;
+    const dead = dialRules.deadEndVerdict(items.filter(c => c.agent_id === agentId && (c.start_timestamp || 0) >= deadSince));
+    const cap = dialRules.dialCapVerdict(items);
+    return { deadEnds: dead.deadEnds, blocked: dead.blocked, dials: cap.dials, capBlocked: cap.blocked };
   } catch (e) {
-    console.warn(`[DIAL-RULES] dead-end check failed for ${toNumber}, allowing dial: ${e.message}`);
-    return { deadEnds: 0, blocked: false };
+    console.warn(`[DIAL-RULES] call-history check failed for ${toNumber}, allowing dial: ${e.message}`);
+    return open;
   }
 }
 
@@ -553,6 +561,7 @@ async function createBatchCall(prospects, options = {}) {
     const skippedDuplicate = [];
     const skippedOutsideHours = [];
     const skippedDeadEnd = [];
+    const skippedDialCap = [];
     const agentId = AGENTS[agentKey].agent_id;
     const dedupe = !!AGENTS[agentKey].daily_phone_dedupe;
     for (const task of payload.tasks) {
@@ -570,8 +579,15 @@ async function createBatchCall(prospects, options = {}) {
         }
       }
       // 2026-10-29 (D3): stop redialling a switchboard that keeps dead-ending.
+      // 2026-10-30 (D5): at most DIAL_CAP real dials per number per DIAL_CAP_DAYS.
       if (dedupe) {
-        const verdict = await deadEndCheck(agentId, task.to_number);
+        const verdict = await numberHistoryCheck(agentId, task.to_number);
+        if (verdict.capBlocked) {
+          console.log(`[DIAL-RULES] ${task.to_number} deferred: ${verdict.dials} dials in ${dialRules.DIAL_CAP_DAYS} days (cap ${dialRules.DIAL_CAP})`);
+          skippedDialCap.push(task.to_number);
+          skippedDuplicate.push(task.to_number);
+          continue;
+        }
         if (verdict.blocked) {
           console.log(`[DIAL-RULES] ${task.to_number} deferred: ${verdict.deadEnds} phone-menu/no-person dead ends in ${dialRules.DEAD_END_LOOKBACK_DAYS} days`);
           skippedDeadEnd.push(task.to_number);
@@ -621,6 +637,7 @@ async function createBatchCall(prospects, options = {}) {
       skipped_duplicate: skippedDuplicate,
       skipped_outside_hours: skippedOutsideHours,
       skipped_dead_end: skippedDeadEnd,
+      skipped_dial_cap: skippedDialCap,
       override_agent_id: AGENTS[agentKey].agent_id,
     };
   }
@@ -658,7 +675,7 @@ function parseProspectList(filePath) {
   return Array.isArray(data) ? data : data.prospects || data.tasks || [];
 }
 
-// ─── CLI ────────────────────────────────────────────────────────────────────
+// ─── CLI ───────────────────────────────────────────────────────────────────────────
 
 async function main() {
   const args = process.argv.slice(2);

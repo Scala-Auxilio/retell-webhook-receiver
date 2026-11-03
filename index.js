@@ -4,6 +4,7 @@ const cron = require("node-cron");
 const { Pool } = require("pg");
 const calendly = require("./calendly");
 const scorer = require("./interaction-scorer");
+const { ensureSchema } = require("./schema");
 const recon = require("./recon");
 const odooProxy = require("./odoo-proxy");
 const { createBatchCall, validateProspect, mapZohoLead, mapZohoRecord, agentFromAriaStatus, AGENTS } = require("./batch-caller");
@@ -112,14 +113,24 @@ const ALERT_OVERRIDE_TO = process.env.ALERT_OVERRIDE_TO || "";
 const SANDBOX_MANAGER_NAME = process.env.SANDBOX_MANAGER_NAME || null;
 const SANDBOX_MANAGER_EMAIL = process.env.SANDBOX_MANAGER_EMAIL || null;
 
-if (!DATABASE_URL) {
-  console.error("FATAL: DATABASE_URL environment variable is not set.");
+// ─── Which database ────────────────────────────────────────────────────────────
+// CLIENT_DATABASE_URL points at the receiver's own "client-data" Postgres
+// (workstream G). When it is set it wins; DATABASE_URL (the Postgres shared
+// with Paperclip) is the fallback until the switch. The choice is logged by
+// name only and reported on /health as "source".
+const CLIENT_DATABASE_URL = process.env.CLIENT_DATABASE_URL || null;
+const ACTIVE_DATABASE_URL = CLIENT_DATABASE_URL || DATABASE_URL;
+const DATABASE_SOURCE = CLIENT_DATABASE_URL ? "client-data" : "shared";
+
+if (!ACTIVE_DATABASE_URL) {
+  console.error("FATAL: neither CLIENT_DATABASE_URL nor DATABASE_URL is set.");
   process.exit(1);
 }
+console.log(`Database: ${DATABASE_SOURCE} (${CLIENT_DATABASE_URL ? "CLIENT_DATABASE_URL" : "DATABASE_URL"})`);
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 const pool = new Pool({
-  connectionString: DATABASE_URL,
+  connectionString: ACTIVE_DATABASE_URL,
   ssl: process.env.DB_SSL === "false" ? false : { rejectUnauthorized: false },
   max: 5,
   idleTimeoutMillis: 30000,
@@ -127,111 +138,9 @@ const pool = new Pool({
 });
 
 // ─── Table creation on startup ────────────────────────────────────────────────
+// All DDL lives in schema.js so the migration script creates the same tables.
 async function initDatabase() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS retell_events (
-        id              SERIAL PRIMARY KEY,
-        event_type      VARCHAR(64) NOT NULL,
-        agent_id        VARCHAR(128),
-        call_id         VARCHAR(128),
-        transcript      TEXT,
-        call_analysis   JSONB,
-        full_payload    JSONB NOT NULL,
-        received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-
-    // Indexes for fast lookups by the Paperclip agents
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retell_events_agent_id    ON retell_events (agent_id);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retell_events_event_type  ON retell_events (event_type);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retell_events_received_at ON retell_events (received_at);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retell_events_call_id     ON retell_events (call_id);
-    `);
-
-    // Notifications log table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS notifications (
-        id          SERIAL PRIMARY KEY,
-        subject     VARCHAR(255) NOT NULL,
-        body        TEXT,
-        priority    VARCHAR(32) DEFAULT 'normal',
-        source      VARCHAR(128),
-        status      VARCHAR(32) NOT NULL DEFAULT 'sent',
-        error       TEXT,
-        sent_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-
-    console.log("Database table retell_events ready with indexes.");
-    console.log("Database table notifications ready.");
-
-    // Bunker price cache table — populated by daily cron from shipandbunker.com
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bunker_prices (
-        id          SERIAL PRIMARY KEY,
-        fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        port        VARCHAR(64) NOT NULL,
-        grade       VARCHAR(32) NOT NULL,
-        usd_per_mt  NUMERIC(8,2) NOT NULL,
-        source      VARCHAR(64) NOT NULL,
-        status      VARCHAR(16) DEFAULT 'ok'
-      );
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_bunker_prices_fetched
-        ON bunker_prices (port, grade, fetched_at DESC);
-    `);
-    console.log("Database table bunker_prices ready.");
-
-    // EconoWind leads table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS econowind_leads (
-        id                SERIAL PRIMARY KEY,
-        company_name      VARCHAR(255),
-        contact_name      VARCHAR(255),
-        contact_email     VARCHAR(255),
-        contact_phone     VARCHAR(64),
-        job_title         VARCHAR(255),
-        fleet_size        VARCHAR(64),
-        vessel_types      TEXT,
-        region            VARCHAR(128),
-        timeline          VARCHAR(128),
-        decision_authority VARCHAR(128),
-        awareness_level   VARCHAR(128),
-        specific_interest TEXT,
-        conversation_summary TEXT,
-        revenue_score     INTEGER,
-        conversion_score  INTEGER,
-        total_score       INTEGER,
-        priority          VARCHAR(4),
-        assigned_manager  VARCHAR(255),
-        manager_email     VARCHAR(255),
-        notification_sent BOOLEAN DEFAULT FALSE,
-        received_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_econowind_leads_priority ON econowind_leads (priority);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_econowind_leads_received ON econowind_leads (received_at);
-    `);
-    console.log("Database table econowind_leads ready.");
-
-    // Interaction scores table (for Paperclip Interaction Scorer agent)
-    await scorer.initScorerTable(pool);
-  } finally {
-    client.release();
-  }
+  await ensureSchema(pool);
 }
 
 // ─── Email via Resend HTTP API ───────────────────────────────────────────────
@@ -779,7 +688,7 @@ app.get("/", (_req, res) => {
 app.get("/health", async (_req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ status: "healthy", database: "connected" });
+    res.json({ status: "healthy", database: "connected", source: DATABASE_SOURCE });
   } catch (err) {
     res.status(503).json({ status: "unhealthy", database: err.message });
   }
@@ -3617,7 +3526,7 @@ function scheduleRetryTickCron() {
 async function start() {
   try {
     await initDatabase();
-    await analyst.initAnalystTables(pool);
+    // prompt_change_proposals is created by ensureSchema (schema.js)
     scheduleRetryTickCron();
   scheduleBunkerPriceCron();
     scheduleScorerSweepCron();

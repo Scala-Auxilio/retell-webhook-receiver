@@ -69,6 +69,18 @@ test("countTables and compareCounts report match or difference per table and tol
   assert.match(formatTable(c.rows), /table\s+source\s+target/);
 });
 
+test("fingerprint is 8 hex chars of the sha256 and the receiver logs it without the value", async () => {
+  const { fingerprint, passwordFromUrl } = await import("../scripts/lib/migrate-lib.mjs");
+  assert.match(fingerprint("pw-not-real"), /^[0-9a-f]{8}$/);
+  assert.notEqual(fingerprint("pw-not-real"), fingerprint("pw-not-real-2"));
+  assert.equal(passwordFromUrl("postgresql://receiver_app:p%40ss@host:5432/db"), "p@ss");
+  assert.equal(passwordFromUrl("postgresql://host:5432/db"), null);
+  const src = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  assert.match(src, /receiver_app password fingerprint \(CLIENT_DATABASE_URL\)/);
+  assert.match(src, /digest\("hex"\)\.slice\(0, 8\)/);
+  assert.doesNotMatch(src, /console\.log\([^\n]*CLIENT_DATABASE_URL\}/, "the URL itself is never logged");
+});
+
 test("parseSteps takes the step from the command line or MIGRATION_STEP, several in order, and rejects unknown ones", async () => {
   const { parseSteps } = await import("../scripts/lib/migrate-lib.mjs");
   assert.deepEqual(parseSteps(["counts"], { MIGRATION_STEP: "copy" }), { steps: ["counts"] });

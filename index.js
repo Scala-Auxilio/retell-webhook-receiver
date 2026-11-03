@@ -128,6 +128,19 @@ if (!ACTIVE_DATABASE_URL) {
 }
 console.log(`Database: ${DATABASE_SOURCE} (${CLIENT_DATABASE_URL ? "CLIENT_DATABASE_URL" : "DATABASE_URL"})`);
 
+// Fingerprint of the receiver_app password (first 8 hex of its SHA-256, never
+// the value) so the migration log and this log can be compared before and
+// after the switch. RECEIVER_APP_PASSWORD may be set on its own first.
+{
+  const fp = (v) => crypto.createHash("sha256").update(String(v), "utf8").digest("hex").slice(0, 8);
+  const pwFromUrl = (raw) => { try { const u = new URL(raw); return u.password ? decodeURIComponent(u.password) : null; } catch { return null; } };
+  const direct = process.env.RECEIVER_APP_PASSWORD || null;
+  const inUrl = CLIENT_DATABASE_URL ? pwFromUrl(CLIENT_DATABASE_URL) : null;
+  if (direct) console.log(`receiver_app password fingerprint (RECEIVER_APP_PASSWORD): ${fp(direct)}`);
+  if (inUrl) console.log(`receiver_app password fingerprint (CLIENT_DATABASE_URL): ${fp(inUrl)}`);
+  if (direct && inUrl && direct !== inUrl) console.error("WARNING: the password inside CLIENT_DATABASE_URL differs from RECEIVER_APP_PASSWORD; the login will fail");
+}
+
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: ACTIVE_DATABASE_URL,

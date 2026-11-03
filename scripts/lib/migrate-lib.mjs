@@ -15,6 +15,18 @@ export function parseSteps(argv, env = {}) {
   return { steps };
 }
 
+// Short fingerprint of a secret: first 8 hex characters of its SHA-256.
+// Enough to tell two values apart in a log, useless for recovering the value.
+import { createHash } from "node:crypto";
+export function fingerprint(value) {
+  return createHash("sha256").update(String(value ?? ""), "utf8").digest("hex").slice(0, 8);
+}
+
+// The password inside a connection string, decoded. Null when absent.
+export function passwordFromUrl(raw) {
+  try { const u = new URL(raw); return u.password ? decodeURIComponent(u.password) : null; } catch { return null; }
+}
+
 export function maskUrl(raw) {
   try {
     const u = new URL(raw);

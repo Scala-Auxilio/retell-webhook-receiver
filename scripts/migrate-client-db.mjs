@@ -20,7 +20,7 @@
 // verify (counts and max ids must match), prove (refused and allowed test
 // queries per login), url (the receiver's connection string, masked).
 import { createRequire } from "node:module";
-import { countTables, compareCounts, formatTable, copyTable, ROLE_SQL, runProof, maskUrl, urlForRole, parseSteps } from "./lib/migrate-lib.mjs";
+import { countTables, compareCounts, formatTable, copyTable, ROLE_SQL, runProof, maskUrl, urlForRole, parseSteps, fingerprint } from "./lib/migrate-lib.mjs";
 
 const require = createRequire(import.meta.url);
 const { Pool } = require("pg");
@@ -46,6 +46,8 @@ async function runStep(cmd) {
   console.log(`\n=== ${cmd} (${new Date().toISOString()}) ===`);
   if (cmd === "idle") { console.log("nothing to do"); return; }
   if (cmd === "roles") {
+    console.log(`receiver_app password fingerprint: ${fingerprint(env("RECEIVER_APP_PASSWORD"))} (the receiver logs the same line at boot; both must match)`);
+    console.log(`receiver_ro password fingerprint: ${fingerprint(env("RECEIVER_RO_PASSWORD"))}`);
     await withPool(env("CLIENT_ADMIN_DATABASE_URL"), async (admin) => {
       const db = new URL(env("CLIENT_ADMIN_DATABASE_URL")).pathname.replace(/^\//, "");
       for (const step of ROLE_SQL(env("RECEIVER_APP_PASSWORD"), env("RECEIVER_RO_PASSWORD"), db)) {
@@ -86,6 +88,7 @@ async function runStep(cmd) {
     if (failed) throw new Error("prove: unexpected outcomes");
   } else if (cmd === "url") {
     console.log(`CLIENT_DATABASE_URL for the receiver (password masked). In Railway it is composed from references, never typed:\n${maskUrl(appUrl())}`);
+    console.log(`receiver_app password fingerprint: ${fingerprint(env("RECEIVER_APP_PASSWORD"))}`);
   }
 }
 

@@ -69,6 +69,15 @@ test("countTables and compareCounts report match or difference per table and tol
   assert.match(formatTable(c.rows), /table\s+source\s+target/);
 });
 
+test("parseSteps takes the step from the command line or MIGRATION_STEP, several in order, and rejects unknown ones", async () => {
+  const { parseSteps } = await import("../scripts/lib/migrate-lib.mjs");
+  assert.deepEqual(parseSteps(["counts"], { MIGRATION_STEP: "copy" }), { steps: ["counts"] });
+  assert.deepEqual(parseSteps([], { MIGRATION_STEP: "roles, schema,counts" }), { steps: ["roles", "schema", "counts"] });
+  assert.deepEqual(parseSteps([], { MIGRATION_STEP: "idle" }), { steps: ["idle"] });
+  assert.match(parseSteps([], {}).error, /no step given/);
+  assert.match(parseSteps([], { MIGRATION_STEP: "drop" }).error, /unknown step/);
+});
+
 test("roles, proof queries and url helpers never expose a password", async () => {
   const { ROLE_SQL, PROOF, runProof, urlForRole, maskUrl } = await import("../scripts/lib/migrate-lib.mjs");
   const steps = ROLE_SQL("app-pw-not-real", "ro-pw-not-real", "railway");

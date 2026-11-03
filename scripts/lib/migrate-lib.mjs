@@ -2,6 +2,19 @@
 // query functions as arguments so it can be tested without a database.
 // Nothing in this file ever prints a connection string.
 
+export const STEPS = ["roles", "schema", "counts", "copy", "verify", "prove", "url", "idle"];
+
+// Steps come from the command line, or from MIGRATION_STEP when the script
+// runs as a temporary Railway service (comma-separated, run in order).
+export function parseSteps(argv, env = {}) {
+  const raw = argv[0] ?? env.MIGRATION_STEP ?? "";
+  const steps = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (steps.length === 0) return { error: "no step given: pass one on the command line or set MIGRATION_STEP" };
+  const bad = steps.filter((s) => !STEPS.includes(s));
+  if (bad.length) return { error: `unknown step(s): ${bad.join(", ")}; valid: ${STEPS.join(", ")}` };
+  return { steps };
+}
+
 export function maskUrl(raw) {
   try {
     const u = new URL(raw);

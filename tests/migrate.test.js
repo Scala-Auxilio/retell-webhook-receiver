@@ -107,3 +107,46 @@ test("roles, proof queries and url helpers never expose a password", async () =>
   assert.equal(url, "postgresql://receiver_app:app-pw-not-real@host.railway.internal:5432/railway");
   assert.equal(maskUrl(url), "postgresql://receiver_app:***@host.railway.internal:5432/railway");
 });
+
+test("copyTable reads json and jsonb columns as their original text, so arrays, objects, null and JSON strings arrive unchanged", async () => {
+  const { copyTable, sharedColumns, sourceSelectList } = await import("../scripts/lib/migrate-lib.mjs");
+  const columns = [["id", "integer"], ["agent_id", "character varying"], ["dimension_scores", "jsonb"], ["flags", "jsonb"], ["notes", "json"], ["tags", "ARRAY"]];
+  // What the source holds, as the exact text Postgres would return for "col"::text.
+  const originals = {
+    1: { dimension_scores: '{"clarity": 4, "empathy": 5}', flags: '["late_greeting", "no_close"]', notes: '"a plain json string"' },
+    2: { dimension_scores: '{"clarity": 2}', flags: null, notes: null },
+  };
+  const sqls = [];
+  const sourceQuery = async (sql, params) => {
+    sqls.push(sql);
+    if (/information_schema/.test(sql)) return { rows: columns.map(([column_name, data_type]) => ({ column_name, data_type })) };
+    // The fake behaves like node-pg: a json column selected bare comes back parsed (an array for flags), one selected ::text comes back as the text.
+    const bare = (name) => !new RegExp(`"${name}"::text AS "${name}"`).test(sql);
+    const rows = Object.entries(originals).filter(([id]) => Number(id) > params[0]).map(([id, o]) => ({
+      id: Number(id), agent_id: "agent_x", tags: ["t1", "t2"],
+      dimension_scores: bare("dimension_scores") ? JSON.parse(o.dimension_scores) : o.dimension_scores,
+      flags: bare("flags") ? (o.flags === null ? null : JSON.parse(o.flags)) : o.flags,
+      notes: bare("notes") ? (o.notes === null ? null : JSON.parse(o.notes)) : o.notes,
+    }));
+    return { rows };
+  };
+  const inserts = [];
+  const targetQuery = async (sql, params) => {
+    sqls.push(sql);
+    if (/information_schema/.test(sql)) return { rows: columns.map(([column_name, data_type]) => ({ column_name, data_type })) };
+    if (/MAX\(id\)/.test(sql) && !/setval/.test(sql)) return { rows: [{ m: 0 }] };
+    if (/^INSERT/.test(sql)) inserts.push(params);
+    return { rows: [] };
+  };
+  const shared = await sharedColumns(sourceQuery, targetQuery, "interaction_scores");
+  assert.deepEqual(shared.map((c) => [c.name, c.type]), [["id", "integer"], ["agent_id", "character varying"], ["dimension_scores", "jsonb"], ["flags", "jsonb"], ["notes", "json"], ["tags", "array"]]);
+  assert.equal(sourceSelectList(shared), '"id", "agent_id", "dimension_scores"::text AS "dimension_scores", "flags"::text AS "flags", "notes"::text AS "notes", "tags"');
+  const r = await copyTable({ table: { name: "interaction_scores", id: "id" }, sourceQuery, targetQuery, batchSize: 10 });
+  assert.equal(r.copied, 2);
+  assert.ok(sqls.some((s) => /SELECT "id", "agent_id", "dimension_scores"::text AS "dimension_scores", "flags"::text AS "flags", "notes"::text AS "notes", "tags" FROM interaction_scores/.test(s)), "json columns are read as text, the array column as is");
+  const per = 6;
+  const [p1, p2] = [inserts[0].slice(0, per), inserts[0].slice(per, 2 * per)];
+  assert.deepEqual(p1, [1, "agent_x", '{"clarity": 4, "empathy": 5}', '["late_greeting", "no_close"]', '"a plain json string"', ["t1", "t2"]]);
+  assert.deepEqual(p2, [2, "agent_x", '{"clarity": 2}', null, null, ["t1", "t2"]]);
+  assert.equal(typeof p1[3], "string", "a jsonb array travels as text, never as a JS array");
+});

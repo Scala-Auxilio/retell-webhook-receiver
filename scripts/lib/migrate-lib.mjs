@@ -77,24 +77,40 @@ export function formatTable(rows) {
 }
 
 // Column names shared by both sides, in the source's order.
+// Columns present on both sides, in source order, each with the source's
+// data_type (information_schema.columns.data_type: "json", "jsonb", "ARRAY",
+// "text", ...). The type decides how a value travels (see copyTable).
 export async function sharedColumns(sourceQuery, targetQuery, table) {
-  const q = (query) => query(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`, [table]);
-  const s = (await q(sourceQuery)).rows.map((r) => r.column_name);
+  const q = (query) => query(`SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`, [table]);
+  const s = (await q(sourceQuery)).rows.map((r) => ({ name: r.column_name, type: String(r.data_type ?? "").toLowerCase() }));
   const t = new Set((await q(targetQuery)).rows.map((r) => r.column_name));
-  return s.filter((c) => t.has(c));
+  return s.filter((c) => t.has(c.name));
+}
+
+export const JSON_TYPES = new Set(["json", "jsonb"]);
+
+// How one column is read from the source. json and jsonb travel as their
+// exact original text: node-pg parses them into JS values on read, and a JS
+// array sent back as a parameter becomes a Postgres array literal ("{...}"),
+// which a json column refuses (interaction_scores, 4 Nov 2026). Every other
+// type, real Postgres arrays included, is read as is.
+export function sourceSelectList(cols) {
+  return cols.map((c) => (JSON_TYPES.has(c.type) ? `"${c.name}"::text AS "${c.name}"` : `"${c.name}"`)).join(", ");
 }
 
 // Copies rows with id > the target's current max id, in batches, preserving
 // ids, then sets the sequence. Resumable: running it again copies only what
 // is new on the source. `targetQuery` must run inside the target connection.
 export async function copyTable({ table, sourceQuery, targetQuery, batchSize = 1000, log = () => {} }) {
-  const cols = await sharedColumns(sourceQuery, targetQuery, table.name);
-  if (cols.length === 0) throw new Error(`${table.name}: no shared columns; create the schema on the target first`);
+  const shared = await sharedColumns(sourceQuery, targetQuery, table.name);
+  if (shared.length === 0) throw new Error(`${table.name}: no shared columns; create the schema on the target first`);
+  const cols = shared.map((c) => c.name);
   const quoted = cols.map((c) => `"${c}"`).join(", ");
+  const selectList = sourceSelectList(shared);
   const start = Number((await targetQuery(`SELECT COALESCE(MAX(${table.id}), 0)::bigint AS m FROM ${table.name}`)).rows[0].m);
   let last = start, copied = 0;
   for (;;) {
-    const batch = await sourceQuery(`SELECT ${quoted} FROM ${table.name} WHERE ${table.id} > $1 ORDER BY ${table.id} ASC LIMIT $2`, [last, batchSize]);
+    const batch = await sourceQuery(`SELECT ${selectList} FROM ${table.name} WHERE ${table.id} > $1 ORDER BY ${table.id} ASC LIMIT $2`, [last, batchSize]);
     if (batch.rows.length === 0) break;
     const values = [], params = [];
     for (const row of batch.rows) {

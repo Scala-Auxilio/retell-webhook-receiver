@@ -112,3 +112,7 @@ Only after seven days on `client-data` with no problem, a fresh manual backup of
 ## Checks Claude Code does from Railway (read-only)
 
 Deploy log lines of the `migrate` service per step (masked), `Database: client-data` on the receiver, `/health` source, no connection errors after the switch, the Reconciliation Checker's next run normal, and the `client-data` Postgres showing PITR variables and its bucket. Claude Code never reads variable values.
+
+## Reuse for the shared Postgres password rotation (workstream E)
+
+The same temporary service runs `MIGRATION_STEP=rotate-postgres-password` with `SOURCE_DATABASE_URL=${{Postgres.DATABASE_URL}}` and `NEW_POSTGRES_PASSWORD=${{shared.POSTGRES_PASSWORD_NEW}}` (a sealed shared variable entered by Petrus; letters and digits, at least 24 characters). It changes the password of the role the URL logs in as with one `ALTER ROLE`, reconnects with the new password to prove it, and prints the role name and an 8-character fingerprint, never a value. The Railway variables are changed separately (staged before, deployed right after): the Postgres template does not change a running role's password when its variable changes. The full procedure with readbacks and rollback is `docs/rotation-2026-11.md` in paperclip-railway.

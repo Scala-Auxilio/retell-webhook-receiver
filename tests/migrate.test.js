@@ -107,3 +107,19 @@ test("roles, proof queries and url helpers never expose a password", async () =>
   assert.equal(url, "postgresql://receiver_app:app-pw-not-real@host.railway.internal:5432/railway");
   assert.equal(maskUrl(url), "postgresql://receiver_app:***@host.railway.internal:5432/railway");
 });
+
+test("rotate-postgres-password: valid step, URL-safe password rule, ALTER ROLE through format() with the value as a parameter, URL rewrite keeps host and database", async () => {
+  const { parseSteps, validateNewPassword, ROTATE_SQL, urlWithPassword, maskUrl } = await import("../scripts/lib/migrate-lib.mjs");
+  assert.deepEqual(parseSteps(["rotate-postgres-password"]).steps, ["rotate-postgres-password"]);
+  assert.equal(validateNewPassword("Abcdefghijklmnopqrstuvwxyz123456"), null);
+  assert.match(validateNewPassword("short"), /24 characters/);
+  assert.match(validateNewPassword("Abcdefghijklmnopqrstuvwx@yz12345"), /letters and digits/);
+  const steps = ROTATE_SQL("NEWPASSWORDVALUE0123456789abcdef");
+  assert.equal(steps.length, 1);
+  assert.ok(!steps[0].sql.includes("NEWPASSWORDVALUE"), "the value is a parameter, not part of the SQL text");
+  assert.deepEqual(steps[0].params, ["NEWPASSWORDVALUE0123456789abcdef"]);
+  assert.match(steps[0].sql, /ALTER ROLE %I WITH PASSWORD %L/);
+  const u = urlWithPassword("postgresql://postgres:oldsecret@postgres.railway.internal:5432/railway", "NEWPASSWORDVALUE0123456789abcdef");
+  assert.equal(u, "postgresql://postgres:NEWPASSWORDVALUE0123456789abcdef@postgres.railway.internal:5432/railway");
+  assert.equal(maskUrl(u), "postgresql://postgres:***@postgres.railway.internal:5432/railway");
+});

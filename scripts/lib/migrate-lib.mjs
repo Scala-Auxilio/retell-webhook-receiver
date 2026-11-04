@@ -2,7 +2,7 @@
 // query functions as arguments so it can be tested without a database.
 // Nothing in this file ever prints a connection string.
 
-export const STEPS = ["roles", "schema", "counts", "copy", "verify", "prove", "url", "idle"];
+export const STEPS = ["roles", "schema", "counts", "copy", "verify", "prove", "url", "rotate-postgres-password", "idle"];
 
 // Steps come from the command line, or from MIGRATION_STEP when the script
 // runs as a temporary Railway service (comma-separated, run in order).
@@ -158,4 +158,26 @@ export async function runProof(role, query) {
     catch (err) { results.push({ role, test: q.label, expected: "refused", outcome: `refused (${err.code || "error"})`, pass: true }); }
   }
   return results;
+}
+
+// ── Password rotation of the connected role (workstream E) ───────────────────
+// The Railway Postgres template reads POSTGRES_PASSWORD only when the data
+// directory is first created, so a rotation changes the role with SQL and the
+// variables separately. The new value is a format() parameter, never part of
+// the printed SQL. The role is whatever the connection string logs in as.
+export function validateNewPassword(value) {
+  if (typeof value !== "string" || value.length < 24) return "must be at least 24 characters";
+  if (!/^[A-Za-z0-9]+$/.test(value)) return "must be letters and digits only (it travels inside connection strings)";
+  return null;
+}
+
+export const ROTATE_SQL = (newPassword) => [
+  { sql: `SELECT format('ALTER ROLE %I WITH PASSWORD %L', current_user, $1::text)`, params: [newPassword], exec: true, label: "alter role password" },
+];
+
+// The same connection string with another password.
+export function urlWithPassword(raw, password) {
+  const u = new URL(raw);
+  u.password = password;
+  return u.toString();
 }

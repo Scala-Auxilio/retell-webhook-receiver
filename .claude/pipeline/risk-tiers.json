@@ -1,0 +1,51 @@
+{
+  "default": "high",
+  "approvalLabel": "human-approved",
+  "rules": [
+    {
+      "tier": "high",
+      "patterns": [
+        "index.js",
+        "batch-caller.js",
+        "auth.js",
+        "schema.js",
+        "calendly.js",
+        "tidycal.js",
+        "odoo-proxy.js",
+        "sendsteps-chat.js",
+        "package.json",
+        "package-lock.json",
+        "Dockerfile",
+        "entrypoint.sh",
+        "sql/**",
+        "scripts/**",
+        ".github/**",
+        ".claude/agents/**",
+        ".claude/pipeline/**",
+        ".claude/settings.json",
+        "CLAUDE.md",
+        "tests/pipeline.test.js"
+      ]
+    },
+    {
+      "tier": "medium",
+      "patterns": [
+        "interaction-scorer.js",
+        "intelligence-analyst.js",
+        "scout-outcome.js",
+        "recon.js",
+        "compliance-flags.js"
+      ]
+    },
+    {
+      "tier": "low",
+      "patterns": [
+        "docs/**",
+        "tests/**",
+        ".claude/briefs/**",
+        ".claude/runs/**",
+        "**/*.md"
+      ]
+    }
+  ]
+}

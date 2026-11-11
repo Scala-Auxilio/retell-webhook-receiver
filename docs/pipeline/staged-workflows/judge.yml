@@ -1,0 +1,63 @@
+name: Judge
+
+# Runs the read-only judge agent on every PR to main. Required check: "judge".
+# Fails closed: kill switch off, missing secret, empty or malformed verdict all fail the check.
+# The judge cannot edit files: Write and Edit are not allowed, and the verdict is a JSON object.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+concurrency:
+  group: judge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  judge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Kill switch (fails closed)
+        env:
+          ENABLED: ${{ vars.AGENT_PIPELINE_ENABLED }}
+        run: |
+          if [ "$ENABLED" != "true" ]; then
+            echo "Agent pipeline is switched off (AGENT_PIPELINE_ENABLED is not true). Failing closed."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run the judge
+        id: judge
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Read .claude/agents/judge.md and follow it exactly as your instructions.
+            Also read CLAUDE.md. The pull request is ${{ github.event.pull_request.number }}.
+            The diff is `git diff --no-renames origin/${{ github.base_ref }}...HEAD`.
+            Return only the JSON verdict described in judge.md.
+          claude_args: |
+            --max-turns 15
+            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
+            --disallowedTools "Write,Edit,NotebookEdit,WebFetch,WebSearch"
+            --json-schema '{"type":"object","properties":{"pass":{"type":"boolean"},"plan_found":{"type":"boolean"},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object","properties":{"file":{"type":"string"},"line":{"type":"integer"},"command":{"type":"string"},"problem":{"type":"string"}},"required":["file","command","problem"]}}},"required":["pass","plan_found","summary","findings"]}'
+
+      - name: Evaluate the verdict (fails closed)
+        if: always()
+        env:
+          VERDICT: ${{ steps.judge.outputs.structured_output }}
+        run: node scripts/pipeline/evaluate-verdict.mjs

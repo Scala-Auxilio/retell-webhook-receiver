@@ -1,0 +1,32 @@
+name: Tier gate
+
+# Classifies the files a PR changes. A high-risk change fails this check until a human
+# adds the "human-approved" label. Required check: "tier-gate".
+# Files not listed in .claude/pipeline/risk-tiers.json count as high.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tier-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Classify changed files and enforce the human gate
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BASE_REF: origin/${{ github.base_ref }}
+        run: node scripts/pipeline/risk-tier.mjs --base "$BASE_REF" --head HEAD --gate
